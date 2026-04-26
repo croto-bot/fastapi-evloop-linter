@@ -8,7 +8,7 @@ Optimize the fastapi-evloop-linter to detect ALL event loop blocking calls in Fa
 - **Secondary**: detection_rate (%), cases_missed, false_positives, elapsed_ms
 
 ## How to Run
-`uv run python benchmark.py` — outputs METRIC lines.
+`uv run python benchmark.py` or `./autoresearch.sh` — outputs METRIC lines.
 
 ## Files in Scope
 - `src/fastapi_evloop_linter/blockers.py` — Registry of known blocking patterns
@@ -30,6 +30,11 @@ Optimize the fastapi-evloop-linter to detect ALL event loop blocking calls in Fa
 
 ## What's Been Tried
 - **Baseline**: 3 missed violations (91.7% detection rate)
-  - `aliased_from_import`: `from subprocess import run as execute` — aliased from-imports not resolved
-  - `chained_session`: `requests.Session().get()` — chained calls: only Session detected, not .get()
-  - `callback_blocking`: callback pattern — blocking call inside function passed as argument (depth 8, very hard)
+  - `aliased_from_import`: from-import with alias not resolved
+  - `chained_session`: requests.Session().get() not detected
+  - `callback_blocking`: callback pattern not detected
+- **Fix 1**: Return original import name (not alias) in call resolution → fixed aliased_from_import
+- **Fix 2**: Match module-level patterns even when object_type is set → fixed chained_session
+- **Fix 3**: Positional arg tracking with None placeholders for callback flow → fixed callback_blocking
+- **Result**: 100% detection rate (0 missed, 0 false positives) across 44 adversarial test cases
+- **Hardened**: Added 11 more adversarial cases (router decorators, depth 7 chains, map callbacks, builtin open, aliased modules) — all pass
