@@ -1,0 +1,14 @@
+[project]
+name = "fastapi-evloop-linter"
+version = "0.1.0"
+description = "Detect event loop blocking calls in FastAPI async endpoints"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+fastapi-evloop-linter = "fastapi_evloop_linter.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
