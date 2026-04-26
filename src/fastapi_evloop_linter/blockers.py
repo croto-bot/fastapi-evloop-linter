@@ -95,6 +95,14 @@ BLOCKING_PATTERNS: list[BlockingPattern] = [
     # redis sync
     BlockingPattern("redis", "Redis", "function", "error", "redis.Redis is synchronous; use redis.asyncio.Redis"),
     BlockingPattern("redis", "StrictRedis", "function", "error", "redis.StrictRedis is synchronous"),
+    # shutil module - all synchronous blocking I/O
+    BlockingPattern("shutil", "copytree", "function", "error", "shutil.copytree() is synchronous; use asyncio.to_thread(shutil.copytree, ...)"),
+    BlockingPattern("shutil", "rmtree", "function", "error", "shutil.rmtree() is synchronous; use asyncio.to_thread(shutil.rmtree, ...)"),
+    BlockingPattern("shutil", "copy", "function", "error", "shutil.copy() is synchronous; use asyncio.to_thread(shutil.copy, ...)"),
+    BlockingPattern("shutil", "copy2", "function", "error", "shutil.copy2() is synchronous; use asyncio.to_thread(shutil.copy2, ...)"),
+    BlockingPattern("shutil", "move", "function", "error", "shutil.move() is synchronous; use asyncio.to_thread(shutil.move, ...)"),
+    BlockingPattern("shutil", "make_archive", "function", "error", "shutil.make_archive() is synchronous; use asyncio.to_thread(shutil.make_archive, ...)"),
+    BlockingPattern("shutil", "unpack_archive", "function", "error", "shutil.unpack_archive() is synchronous; use asyncio.to_thread(shutil.unpack_archive, ...)"),
 ]
 
 # Build lookup dicts for fast matching

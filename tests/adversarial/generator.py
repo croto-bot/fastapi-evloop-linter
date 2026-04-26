@@ -63,6 +63,7 @@ def generate_all_cases() -> list[TestCase]:
     cases.extend(_blocking_constructor_cases())
     cases.extend(_higher_order_cases())
     cases.extend(_property_blocking_cases())
+    cases.extend(_shutil_blocking_cases())
     return cases
 
 
@@ -1329,6 +1330,260 @@ def _property_blocking_cases() -> list[TestCase]:
             expected_min_depth=0,
             category="blocking_property",
             description="Property that makes blocking HTTP request",
+        ),
+    ]
+
+
+def _shutil_blocking_cases() -> list[TestCase]:
+    """Cases with shutil blocking operations."""
+    return [
+        TestCase(
+            name="shutil_copytree_direct",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/backup")
+                async def backup_files():
+                    shutil.copytree("/data/src", "/data/backup")
+                    return {"status": "backed up"}
+            """),
+            difficulty=1,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="Direct shutil.copytree() in async endpoint",
+        ),
+        TestCase(
+            name="shutil_rmtree_direct",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.delete("/cleanup")
+                async def cleanup():
+                    shutil.rmtree("/tmp/old_data")
+                    return {"status": "cleaned"}
+            """),
+            difficulty=1,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="Direct shutil.rmtree() in async endpoint",
+        ),
+        TestCase(
+            name="shutil_copy_direct",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/copy")
+                async def copy_file():
+                    shutil.copy("/data/file.txt", "/backup/file.txt")
+                    return {"status": "copied"}
+            """),
+            difficulty=1,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="Direct shutil.copy() in async endpoint",
+        ),
+        TestCase(
+            name="shutil_move_direct",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/move")
+                async def move_file():
+                    shutil.move("/data/old.txt", "/archive/old.txt")
+                    return {"status": "moved"}
+            """),
+            difficulty=1,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="Direct shutil.move() in async endpoint",
+        ),
+        TestCase(
+            name="shutil_archive_direct",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/archive")
+                async def create_archive():
+                    shutil.make_archive("/backup/data", "zip", "/data")
+                    return {"status": "archived"}
+            """),
+            difficulty=1,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="Direct shutil.make_archive() in async endpoint",
+        ),
+        TestCase(
+            name="shutil_unpack_archive_direct",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/extract")
+                async def extract_archive():
+                    shutil.unpack_archive("/upload/data.zip", "/data/extracted")
+                    return {"status": "extracted"}
+            """),
+            difficulty=1,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="Direct shutil.unpack_archive() in async endpoint",
+        ),
+        TestCase(
+            name="shutil_multiple_operations",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/migrate")
+                async def migrate_data():
+                    shutil.copytree("/data/src", "/data/backup")
+                    shutil.rmtree("/data/src")
+                    return {"status": "migrated"}
+            """),
+            difficulty=1,
+            expected_violations=2,
+            expected_min_depth=0,
+            category="shutil",
+            description="Multiple shutil operations in one endpoint",
+        ),
+        TestCase(
+            name="shutil_deep_chain",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def backup_data(src, dst):
+                    shutil.copytree(src, dst)
+
+                @app.post("/backup")
+                async def backup_endpoint():
+                    backup_data("/data/src", "/data/backup")
+                    return {"status": "ok"}
+            """),
+            difficulty=3,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="shutil",
+            description="shutil.copytree() through helper function (depth 1)",
+        ),
+        TestCase(
+            name="shutil_deep_chain_3",
+            source=textwrap.dedent("""\
+                import shutil
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def do_archive(src, dst):
+                    shutil.make_archive(dst, "zip", src)
+
+                def run_backup(src, dst):
+                    do_archive(src, dst)
+
+                @app.post("/backup")
+                async def backup_endpoint():
+                    run_backup("/data", "/backup")
+                    return {"status": "ok"}
+            """),
+            difficulty=4,
+            expected_violations=1,
+            expected_min_depth=2,
+            category="shutil",
+            description="shutil.make_archive() through 2 helper functions (depth 2)",
+        ),
+        TestCase(
+            name="shutil_aliased_import",
+            source=textwrap.dedent("""\
+                import shutil as sh
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/backup")
+                async def backup_files():
+                    sh.copytree("/data/src", "/data/backup")
+                    return {"status": "backed up"}
+            """),
+            difficulty=3,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="shutil imported as alias, then sh.copytree() called",
+        ),
+        TestCase(
+            name="shutil_from_import",
+            source=textwrap.dedent("""\
+                from shutil import copytree
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/backup")
+                async def backup_files():
+                    copytree("/data/src", "/data/backup")
+                    return {"status": "backed up"}
+            """),
+            difficulty=2,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="from shutil import copytree, then copytree() called",
+        ),
+        TestCase(
+            name="shutil_from_import_aliased",
+            source=textwrap.dedent("""\
+                from shutil import rmtree as remove_tree
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.delete("/cleanup")
+                async def cleanup():
+                    remove_tree("/tmp/old_data")
+                    return {"status": "cleaned"}
+            """),
+            difficulty=4,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="shutil",
+            description="from shutil import rmtree as remove_tree",
+        ),
+        TestCase(
+            name="shutil_mixed_with_other_blocking",
+            source=textwrap.dedent("""\
+                import shutil
+                import time
+                import requests
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.post("/heavy")
+                async def heavy_operation():
+                    time.sleep(1)
+                    requests.get("https://example.com")
+                    shutil.copytree("/data/src", "/data/backup")
+                    return {"status": "done"}
+            """),
+            difficulty=1,
+            expected_violations=3,
+            expected_min_depth=0,
+            category="shutil",
+            description="shutil mixed with time.sleep and requests.get",
         ),
     ]
 
