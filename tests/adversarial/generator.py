@@ -57,6 +57,12 @@ def generate_all_cases() -> list[TestCase]:
     cases.extend(_callback_deep_cases())
     cases.extend(_open_builtin_cases())
     cases.extend(_aliased_module_cases())
+    cases.extend(_variable_alias_cases())
+    cases.extend(_class_dunder_cases())
+    cases.extend(_blocking_decorator_cases())
+    cases.extend(_blocking_constructor_cases())
+    cases.extend(_higher_order_cases())
+    cases.extend(_property_blocking_cases())
     return cases
 
 
@@ -992,6 +998,339 @@ def write_test_cases(cases: list[TestCase], output_dir: str | Path) -> None:
         })
 
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def _variable_alias_cases() -> list[TestCase]:
+    """Cases where blocking functions are accessed via variable aliasing."""
+    return [
+        TestCase(
+            name="variable_alias_sleep",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/alias")
+                async def alias_endpoint():
+                    f = time.sleep
+                    f(1)
+                    return {"ok": True}
+            """),
+            difficulty=6,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="variable_alias",
+            description="Variable aliasing: f = time.sleep; f(1)",
+        ),
+        TestCase(
+            name="walrus_alias",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/walrus")
+                async def walrus_endpoint():
+                    if (wait := time.sleep):
+                        wait(1)
+                    return {"ok": True}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="variable_alias",
+            description="Walrus operator: (wait := time.sleep); wait(1)",
+        ),
+        TestCase(
+            name="cross_func_alias",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def get_sleeper():
+                    return time.sleep
+
+                @app.get("/cross-alias")
+                async def cross_alias_endpoint():
+                    sleeper = get_sleeper()
+                    sleeper(3)
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="variable_alias",
+            description="Cross-function variable alias via return value",
+        ),
+        TestCase(
+            name="functools_partial",
+            source=textwrap.dedent("""\
+                import time
+                from functools import partial
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/partial")
+                async def partial_endpoint():
+                    wait = partial(time.sleep, 1)
+                    wait()
+                    return {"ok": True}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="variable_alias",
+            description="functools.partial wrapping time.sleep",
+        ),
+    ]
+
+
+def _class_dunder_cases() -> list[TestCase]:
+    """Cases where blocking calls happen in __call__, __enter__, __init__, etc."""
+    return [
+        TestCase(
+            name="class_callable",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class Sleeper:
+                    def __call__(self, seconds):
+                        time.sleep(seconds)
+
+                s = Sleeper()
+
+                @app.get("/callable")
+                async def callable_endpoint():
+                    s(5)
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_dunder",
+            description="Class with __call__ that contains blocking call",
+        ),
+        TestCase(
+            name="context_manager_enter",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class Timer:
+                    def __enter__(self):
+                        time.sleep(1)
+                        return self
+                    def __exit__(self, *args):
+                        pass
+
+                @app.get("/ctx")
+                async def ctx_endpoint():
+                    with Timer():
+                        pass
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_dunder",
+            description="Blocking call in context manager __enter__",
+        ),
+        TestCase(
+            name="blocking_init",
+            source=textwrap.dedent("""\
+                import requests
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class ApiClient:
+                    def __init__(self, url):
+                        self.response = requests.get(url)
+
+                @app.get("/init")
+                async def init_endpoint():
+                    client = ApiClient("https://example.com")
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_dunder",
+            description="Blocking call in __init__ via constructor",
+        ),
+        TestCase(
+            name="dataclass_postinit",
+            source=textwrap.dedent("""\
+                import requests
+                from dataclasses import dataclass
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @dataclass
+                class UserInfo:
+                    url: str
+
+                    def __post_init__(self):
+                        self.data = requests.get(self.url).json()
+
+                @app.get("/dataclass")
+                async def dataclass_endpoint():
+                    user = UserInfo("https://api.example.com/user")
+                    return user.data
+            """),
+            difficulty=9,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_dunder",
+            description="Blocking in dataclass __post_init__",
+        ),
+        TestCase(
+            name="operator_overload",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class Delay:
+                    def __mul__(self, seconds):
+                        time.sleep(seconds)
+                        return self
+
+                d = Delay()
+
+                @app.get("/operator")
+                async def operator_endpoint():
+                    d * 5
+                    return {"ok": True}
+            """),
+            difficulty=9,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_dunder",
+            description="Blocking via operator overloading (__mul__)",
+        ),
+    ]
+
+
+def _blocking_decorator_cases() -> list[TestCase]:
+    """Cases where a decorator introduces blocking behavior."""
+    return [
+        TestCase(
+            name="blocking_decorator",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def slow_decorator(func):
+                    def wrapper(*args, **kwargs):
+                        time.sleep(2)
+                        return func(*args, **kwargs)
+                    return wrapper
+
+                @slow_decorator
+                def compute():
+                    return 42
+
+                @app.get("/decorated")
+                async def decorated_endpoint():
+                    result = compute()
+                    return {"result": result}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="blocking_decorator",
+            description="Function wrapped in a blocking decorator (time.sleep in decorator wrapper)",
+        ),
+    ]
+
+
+def _blocking_constructor_cases() -> list[TestCase]:
+    """Cases where object construction triggers blocking calls."""
+    return [
+        TestCase(
+            name="dict_dispatch",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                HANDLERS = {"wait": time.sleep}
+
+                @app.get("/dispatch")
+                async def dispatch_endpoint():
+                    HANDLERS["wait"](5)
+                    return {"ok": True}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="dict_dispatch",
+            description="Global dict dispatch: HANDLERS['wait'](5) calling time.sleep",
+        ),
+    ]
+
+
+def _higher_order_cases() -> list[TestCase]:
+    """Cases with map/filter and other higher-order function patterns."""
+    return [
+        TestCase(
+            name="map_blocking",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def slow_transform(x):
+                    time.sleep(0.1)
+                    return x * 2
+
+                @app.get("/map")
+                async def map_endpoint():
+                    results = list(map(slow_transform, [1, 2, 3]))
+                    return {"results": results}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="higher_order",
+            description="Blocking call via map() builtin",
+        ),
+    ]
+
+
+def _property_blocking_cases() -> list[TestCase]:
+    """Cases where property access triggers blocking calls."""
+    return [
+        TestCase(
+            name="blocking_property",
+            source=textwrap.dedent("""\
+                import requests
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class Config:
+                    @property
+                    def data(self):
+                        return requests.get("https://example.com").json()
+
+                cfg = Config()
+
+                @app.get("/config")
+                async def config_endpoint():
+                    return cfg.data
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="blocking_property",
+            description="Property that makes blocking HTTP request",
+        ),
+    ]
 
 
 if __name__ == "__main__":

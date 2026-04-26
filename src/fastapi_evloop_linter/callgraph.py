@@ -26,6 +26,8 @@ class CallSite:
     caller_function: str | None = None
     # Function names passed as positional arguments (None for non-Name args)
     arg_names: list[str | None] = field(default_factory=list)
+    # Whether this is a property access (not a direct call)
+    is_property_access: bool = False
 
 
 @dataclass
@@ -40,6 +42,14 @@ class FuncDef:
     var_types: dict[str, str] = field(default_factory=dict)
     # Parameter names (for callback resolution)
     params: list[str] = field(default_factory=list)
+    # Variable aliases: var_name -> (module, func_name) for blocking function refs
+    var_aliases: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
+    # Whether this function is a decorator wrapper that replaces the original
+    is_decorator_wrapper: bool = False
+    # The original function name this wrapper replaces (set when used as decorator)
+    replaces_func: str | None = None
+    # Blocking reference returned by this function: (module, func_name) or None
+    returns_blocking: tuple[str | None, str | None] | None = None
 
 
 @dataclass
@@ -59,6 +69,18 @@ class ModuleAnalysis:
     import_froms: dict[str, ImportInfo] = field(default_factory=dict)  # name -> ImportInfo
     # Call graph: caller_name -> [callee_names]
     call_graph: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    # Class definitions: class_name -> set of method names
+    class_methods: dict[str, set[str]] = field(default_factory=dict)
+    # Dunder method to class mapping: method_name (e.g. "__call__") -> {class_name: func_def_name}
+    dunder_map: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Decorator replacements: original_func_name -> wrapper_func_name
+    decorator_replacements: dict[str, str] = field(default_factory=dict)
+    # Module-level dict literals that map to blocking functions: dict_name -> {key: (module, func_name)}
+    blocking_dicts: dict[str, dict[str, tuple[str | None, str | None]]] = field(default_factory=dict)
+    # Properties: class_name -> set of property names
+    class_properties: dict[str, set[str]] = field(default_factory=dict)
+    # Module-level variable types: var_name -> class_name
+    module_var_types: dict[str, str] = field(default_factory=dict)
 
 
 class CallGraphBuilder(ast.NodeVisitor):
@@ -124,6 +146,23 @@ class CallGraphBuilder(ast.NodeVisitor):
                 imp = self.analysis.import_froms[name]
                 # Return the ORIGINAL name (not alias) so blocker lookup works
                 return imp.module, imp.name, None
+            # Check if it's a variable alias for a blocking function
+            if self._current_func and name in self._current_func.var_aliases:
+                alias_mod, alias_name = self._current_func.var_aliases[name]
+                return alias_mod, alias_name, None
+            # Check if this is a callable object (has __call__)
+            if self._current_func and name in self._current_func.var_types:
+                var_type = self._current_func.var_types[name]
+                call_key = f"{var_type}.__call__"
+                if call_key in self.analysis.functions:
+                    # Return the __call__ key so the checker traces into it
+                    return None, call_key, var_type
+            # Check module-level var types too
+            if name in self.analysis.module_var_types:
+                var_type = self.analysis.module_var_types[name]
+                call_key = f"{var_type}.__call__"
+                if call_key in self.analysis.functions:
+                    return None, call_key, var_type
             return None, name, None
 
         elif isinstance(func, ast.Attribute):
@@ -179,19 +218,89 @@ class CallGraphBuilder(ast.NodeVisitor):
         if not self._current_func:
             return
 
-        if isinstance(target, ast.Name) and isinstance(value, ast.Call):
+        if isinstance(target, ast.Name):
             # Track: var = SomeClass()
-            func = value.func
-            if isinstance(func, ast.Name):
-                name = func.id
-                if name in self.analysis.import_froms:
-                    self._current_func.var_types[target.id] = self.analysis.import_froms[name].name
-                elif name in self.analysis.imports:
-                    self._current_func.var_types[target.id] = name
-                else:
-                    self._current_func.var_types[target.id] = name
-            elif isinstance(func, ast.Attribute):
-                self._current_func.var_types[target.id] = func.attr
+            if isinstance(value, ast.Call):
+                func = value.func
+                if isinstance(func, ast.Name):
+                    name = func.id
+                    if name in self.analysis.import_froms:
+                        self._current_func.var_types[target.id] = self.analysis.import_froms[name].name
+                    elif name in self.analysis.imports:
+                        self._current_func.var_types[target.id] = name
+                    else:
+                        self._current_func.var_types[target.id] = name
+
+                    # Check if the called function returns a blocking reference
+                    callee = self.analysis.functions.get(name)
+                    if callee and callee.returns_blocking:
+                        self._current_func.var_aliases[target.id] = callee.returns_blocking
+
+                elif isinstance(func, ast.Attribute):
+                    self._current_func.var_types[target.id] = func.attr
+
+            # Track variable aliasing to blocking functions
+            # e.g. f = time.sleep  or  f = requests.get
+            self._track_var_alias(target.id, value)
+
+    def _track_var_alias(self, var_name: str, value: ast.expr) -> None:
+        """Track when a variable is assigned a reference to a blocking function."""
+        if not self._current_func:
+            return
+
+        # Direct module.attr reference: f = time.sleep
+        if isinstance(value, ast.Attribute):
+            attr_name = value.attr
+            if isinstance(value.value, ast.Name):
+                base = value.value.id
+                if base in self.analysis.imports:
+                    imp = self.analysis.imports[base]
+                    self._current_func.var_aliases[var_name] = (imp.module, attr_name)
+                    return
+                if base in self.analysis.import_froms:
+                    imp = self.analysis.import_froms[base]
+                    self._current_func.var_aliases[var_name] = (imp.module, attr_name)
+                    return
+
+        # Direct name reference: f = sleep  (where sleep was from-imported)
+        if isinstance(value, ast.Name):
+            ref = value.id
+            if ref in self.analysis.import_froms:
+                imp = self.analysis.import_froms[ref]
+                self._current_func.var_aliases[var_name] = (imp.module, imp.name)
+                return
+            if ref in self.analysis.imports:
+                imp = self.analysis.imports[ref]
+                self._current_func.var_aliases[var_name] = (imp.module, None)
+                return
+            # Check if ref is itself a var alias (propagation)
+            if ref in self._current_func.var_aliases:
+                self._current_func.var_aliases[var_name] = self._current_func.var_aliases[ref]
+                return
+
+        # Walrus operator in NamedExpr: (x := time.sleep)
+        if isinstance(value, ast.NamedExpr):
+            self._track_var_alias(var_name, value.value)
+
+        # functools.partial: wait = partial(time.sleep, 1)
+        if isinstance(value, ast.Call):
+            if isinstance(value.func, ast.Name) and value.func.id == "partial":
+                if value.args:
+                    first_arg = value.args[0]
+                    if isinstance(first_arg, ast.Attribute):
+                        attr_name = first_arg.attr
+                        if isinstance(first_arg.value, ast.Name):
+                            base = first_arg.value.id
+                            if base in self.analysis.imports:
+                                imp = self.analysis.imports[base]
+                                self._current_func.var_aliases[var_name] = (imp.module, attr_name)
+                                return
+                    if isinstance(first_arg, ast.Name):
+                        ref = first_arg.id
+                        if ref in self.analysis.import_froms:
+                            imp = self.analysis.import_froms[ref]
+                            self._current_func.var_aliases[var_name] = (imp.module, imp.name)
+                            return
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -273,7 +382,105 @@ class CallGraphBuilder(ast.NodeVisitor):
         self._scope_stack.pop()
         self._current_func = prev
 
+        # Store function - but check if a decorator wrapper already took this name
         self.analysis.functions[node.name] = func
+
+        # Check if this function is a decorator wrapper that replaces the original
+        # Pattern: a function defined inside another function and returned as decorator result
+        if self._current_func and node.name == "wrapper":
+            # This wrapper might replace a decorated function
+            self._current_func.is_decorator_wrapper = True
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        """Track class definitions and their methods."""
+        methods = set()
+        properties = set()
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Check if it's a property
+                is_prop = any(
+                    self._get_decorator_name(d) == "property"
+                    for d in item.decorator_list
+                )
+                if is_prop:
+                    properties.add(item.name)
+                    # Add property getter as a synthetic function for tracing
+                    prop_key = f"{node.name}.<prop:{item.name}>"
+                    prop_func = FuncDef(
+                        name=prop_key,
+                        is_async=isinstance(item, ast.AsyncFunctionDef),
+                        node=item,
+                        decorators=[self._get_decorator_name(d) for d in item.decorator_list],
+                        params=self._extract_params(item),
+                    )
+                    prev = self._current_func
+                    self._current_func = prop_func
+                    self._scope_stack.append(prop_func)
+                    self.generic_visit(item)
+                    self._scope_stack.pop()
+                    self._current_func = prev
+                    self.analysis.functions[prop_key] = prop_func
+                else:
+                    methods.add(item.name)
+                    # Map dunder methods: e.g. __call__ -> {ClassName: __call___ClassName}
+                    if item.name.startswith("__") and item.name.endswith("__"):
+                        if item.name not in self.analysis.dunder_map:
+                            self.analysis.dunder_map[item.name] = {}
+                        # Use a synthetic name to avoid collisions
+                        dunder_key = f"{node.name}.{item.name}"
+                        self.analysis.dunder_map[item.name][node.name] = dunder_key
+
+                        # Also add the dunder method as a regular function so the checker can trace into it
+                        dunder_func = FuncDef(
+                            name=dunder_key,
+                            is_async=isinstance(item, ast.AsyncFunctionDef),
+                            node=item,
+                            decorators=[self._get_decorator_name(d) for d in item.decorator_list],
+                            params=self._extract_params(item),
+                        )
+                        # Visit the dunder body
+                        prev = self._current_func
+                        self._current_func = dunder_func
+                        self._scope_stack.append(dunder_func)
+                        self.generic_visit(item)
+                        self._scope_stack.pop()
+                        self._current_func = prev
+
+                        self.analysis.functions[dunder_key] = dunder_func
+                    else:
+                        # Non-dunder, non-property methods - still visit their bodies
+                        prev = self._current_func
+                        method_func = FuncDef(
+                            name=item.name,
+                            is_async=isinstance(item, ast.AsyncFunctionDef),
+                            node=item,
+                            decorators=[self._get_decorator_name(d) for d in item.decorator_list],
+                            params=self._extract_params(item),
+                        )
+                        self._current_func = method_func
+                        self._scope_stack.append(method_func)
+                        self.generic_visit(item)
+                        self._scope_stack.pop()
+                        self._current_func = prev
+                        self.analysis.functions[item.name] = method_func
+
+        self.analysis.class_methods[node.name] = methods
+        self.analysis.class_properties[node.name] = properties
+
+        # Visit the class body for nested items (but don't re-visit methods)
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.visit(item)
+
+        # Track module-level variable assignments to this class
+        # (e.g., cfg = Config() at module level)
+        self._track_module_level_class_vars(node.name)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        """Track walrus operator assignments: (x := value)."""
+        if self._current_func and isinstance(node.target, ast.Name):
+            self._track_var_alias(node.target.id, node.value)
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         if self._current_func is None:
@@ -281,6 +488,13 @@ class CallGraphBuilder(ast.NodeVisitor):
             return
 
         module, func_name, obj_type = self._resolve_call_name(node)
+
+        if func_name is None:
+            # Check for dict dispatch: HANDLERS["wait"](5)
+            dict_result = self._resolve_dict_dispatch_call(node)
+            if dict_result:
+                module, func_name = dict_result
+                obj_type = None
 
         if func_name is None:
             self.generic_visit(node)
@@ -309,18 +523,236 @@ class CallGraphBuilder(ast.NodeVisitor):
         # Also record in call graph
         self.analysis.call_graph[self._current_func.name].append(func_name)
 
+        # Handle constructor calls: ClassName() -> trace into ClassName.__init__
+        if isinstance(node.func, ast.Name) and node.func.id in self.analysis.class_methods:
+            class_name = node.func.id
+            init_key = f"{class_name}.__init__"
+            if init_key in self.analysis.functions:
+                init_call = CallSite(
+                    name=init_key,
+                    line=node.lineno,
+                    col=node.col_offset,
+                    module=None,
+                    object_type=class_name,
+                    caller_function=self._current_func.name,
+                    arg_names=arg_names,
+                )
+                self._current_func.calls.append(init_call)
+                self.analysis.call_graph[self._current_func.name].append(init_key)
+
+            # Also check __post_init__ (dataclass pattern)
+            postinit_key = f"{class_name}.__post_init__"
+            if postinit_key in self.analysis.functions:
+                pi_call = CallSite(
+                    name=postinit_key,
+                    line=node.lineno,
+                    col=node.col_offset,
+                    module=None,
+                    object_type=class_name,
+                    caller_function=self._current_func.name,
+                    arg_names=arg_names,
+                )
+                self._current_func.calls.append(pi_call)
+                self.analysis.call_graph[self._current_func.name].append(postinit_key)
+
+        # Handle map(func, items) as higher-order caller
+        if isinstance(node.func, ast.Name) and node.func.id == "map" and len(node.args) >= 2:
+            func_arg = node.args[0]
+            if isinstance(func_arg, ast.Name):
+                map_callee_call = CallSite(
+                    name=func_arg.id,
+                    line=node.lineno,
+                    col=node.col_offset,
+                    module=None,
+                    object_type=None,
+                    caller_function=self._current_func.name,
+                    arg_names=None,
+                )
+                # Add as a proper call site so the checker traces into it
+                self._current_func.calls.append(map_callee_call)
+                self.analysis.call_graph[self._current_func.name].append(func_arg.id)
+
         self.generic_visit(node)
 
+    def _resolve_dict_dispatch_call(self, node: ast.Call) -> tuple[str | None, str | None] | None:
+        """Resolve dict dispatch calls like HANDLERS[\"wait\"](5)."""
+        # The func of the Call should be a Subscript
+        if not isinstance(node.func, ast.Subscript):
+            return None
+
+        subscript = node.func
+        # The value should be a Name referencing a known blocking dict
+        if not isinstance(subscript.value, ast.Name):
+            return None
+
+        dict_name = subscript.value.id
+        if dict_name not in self.analysis.blocking_dicts:
+            return None
+
+        # Get the key
+        key = None
+        if isinstance(subscript.slice, ast.Constant):
+            key = subscript.slice.value
+
+        if key and isinstance(key, str) and key in self.analysis.blocking_dicts[dict_name]:
+            return self.analysis.blocking_dicts[dict_name][key]
+
+        # If we can't resolve the exact key, report the first value as a heuristic
+        # (covers cases where the key is a variable)
+        if self.analysis.blocking_dicts[dict_name]:
+            first_val = next(iter(self.analysis.blocking_dicts[dict_name].values()))
+            return first_val
+
+        return None
+
     def visit_Assign(self, node: ast.Assign) -> None:
-        """Track variable assignments for type inference."""
+        """Track variable assignments for type inference and aliasing."""
         for target in node.targets:
             self._track_assignment_type(target, node.value)
+        # Track module-level assignments
+        if self._current_func is None:
+            self._track_blocking_dict(node)
+            # Track module-level variable types
+            for target in node.targets:
+                if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
+                    if isinstance(node.value.func, ast.Name):
+                        self.analysis.module_var_types[target.id] = node.value.func.id
+        self.generic_visit(node)
+
+    def visit_With(self, node: ast.With) -> None:
+        """Track with-statement context manager calls."""
+        if self._current_func:
+            for item in node.items:
+                if item.context_expr and isinstance(item.context_expr, ast.Call):
+                    # with Timer(): -> Timer() creates object, __enter__ is called
+                    ctx_call = item.context_expr
+                    if isinstance(ctx_call.func, ast.Name):
+                        class_name = ctx_call.func.id
+                        # Record a call to __enter__
+                        enter_key = f"{class_name}.__enter__"
+                        if enter_key in self.analysis.functions:
+                            arg_names: list[str | None] = []
+                            for arg in ctx_call.args:
+                                if isinstance(arg, ast.Name):
+                                    arg_names.append(arg.id)
+                                else:
+                                    arg_names.append(None)
+                            enter_call = CallSite(
+                                name=enter_key,
+                                line=ctx_call.lineno,
+                                col=ctx_call.col_offset,
+                                module=None,
+                                object_type=class_name,
+                                caller_function=self._current_func.name,
+                                arg_names=arg_names,
+                            )
+                            self._current_func.calls.append(enter_call)
+                            self.analysis.call_graph[self._current_func.name].append(enter_key)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         """Track annotated assignments for type inference."""
         if node.target and node.value:
             self._track_assignment_type(node.target, node.value)
+        self.generic_visit(node)
+
+    def visit_Return(self, node: ast.Return) -> None:
+        """Track return statements for blocking function references."""
+        if node.value and self._current_func:
+            resolved = self._resolve_blocking_ref(node.value)
+            if resolved:
+                self._current_func.returns_blocking = resolved
+        self.generic_visit(node)
+
+    def _track_blocking_dict(self, node: ast.Assign) -> None:
+        """Track module-level dict literals that map string keys to blocking functions."""
+        if not isinstance(node.value, ast.Dict):
+            return
+
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                continue
+
+            dict_name = target.id
+            key_map: dict[str, tuple[str | None, str | None]] = {}
+
+            for key, val in zip(node.value.keys, node.value.values):
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    continue
+
+                # Resolve the value to a (module, func_name) pair
+                resolved = self._resolve_blocking_ref(val)
+                if resolved:
+                    key_map[key.value] = resolved
+
+            if key_map:
+                self.analysis.blocking_dicts[dict_name] = key_map
+
+    def _resolve_blocking_ref(self, node: ast.expr) -> tuple[str | None, str | None] | None:
+        """Resolve an AST expression to a (module, func_name) pair if it references a known module."""
+        # module.attr pattern: time.sleep
+        if isinstance(node, ast.Attribute):
+            attr_name = node.attr
+            if isinstance(node.value, ast.Name):
+                base = node.value.id
+                if base in self.analysis.imports:
+                    imp = self.analysis.imports[base]
+                    return (imp.module, attr_name)
+                if base in self.analysis.import_froms:
+                    imp = self.analysis.import_froms[base]
+                    return (imp.module, attr_name)
+        # Direct name: sleep (from-imported)
+        if isinstance(node, ast.Name):
+            ref = node.id
+            if ref in self.analysis.import_froms:
+                imp = self.analysis.import_froms[ref]
+                return (imp.module, imp.name)
+            if ref in self.analysis.imports:
+                imp = self.analysis.imports[ref]
+                return (imp.module, None)
+        return None
+
+    def _track_module_level_class_vars(self, class_name: str) -> None:
+        """Track module-level variables of this class type (best effort)."""
+        # This is called after the class is defined
+        # We look for patterns like: cfg = Config() at module level
+        # These were already tracked in visit_Assign if at module level
+        pass
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        """Track attribute access for property detection."""
+        if self._current_func and isinstance(node.value, ast.Name):
+            var_name = node.value.id
+            attr_name = node.attr
+
+            # Check if this is a property access on a known class
+            # First check function-local var types
+            class_name = None
+            if var_name in self._current_func.var_types:
+                class_name = self._current_func.var_types[var_name]
+            elif var_name in self.analysis.module_var_types:
+                class_name = self.analysis.module_var_types[var_name]
+
+            if class_name and class_name in self.analysis.class_properties:
+                if attr_name in self.analysis.class_properties[class_name]:
+                    prop_key = f"{class_name}.<prop:{attr_name}>"
+                    if prop_key in self.analysis.functions:
+                        prop_call = CallSite(
+                            name=prop_key,
+                            line=node.lineno,
+                            col=node.col_offset,
+                            module=None,
+                            object_type=class_name,
+                            caller_function=self._current_func.name,
+                            arg_names=None,
+                            is_property_access=True,
+                        )
+                        self._current_func.calls.append(prop_call)
+                        self.analysis.call_graph[self._current_func.name].append(prop_key)
+
+            # Also check for dunder call patterns: s(5) -> resolve s type to class, trace __call__
+            # This is handled in visit_Call via _resolve_call_name
+
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
@@ -330,7 +762,110 @@ class CallGraphBuilder(ast.NodeVisitor):
             pass
         self.generic_visit(node)
 
-    visit_AsyncFor = visit_For
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        """Track loop variable types."""
+        self.visit_For(node)
+
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        """Track operator overloading: d * 5 -> Delay.__mul__."""
+        if self._current_func and isinstance(node.left, ast.Name):
+            var_name = node.left.id
+            # Check if this variable has a known type with dunder methods
+            class_name = None
+            if var_name in self._current_func.var_types:
+                class_name = self._current_func.var_types[var_name]
+            elif var_name in self.analysis.module_var_types:
+                class_name = self.analysis.module_var_types[var_name]
+
+            if class_name:
+                op_dunders = {
+                    ast.Add: "__add__",
+                    ast.Sub: "__sub__",
+                    ast.Mult: "__mul__",
+                    ast.Div: "__truediv__",
+                    ast.FloorDiv: "__floordiv__",
+                    ast.Mod: "__mod__",
+                    ast.Pow: "__pow__",
+                    ast.MatMult: "__matmul__",
+                }
+                dunder = op_dunders.get(type(node.op))
+                if dunder:
+                    dunder_key = f"{class_name}.{dunder}"
+                    if dunder_key in self.analysis.functions:
+                        binop_call = CallSite(
+                            name=dunder_key,
+                            line=node.lineno,
+                            col=node.col_offset,
+                            module=None,
+                            object_type=class_name,
+                            caller_function=self._current_func.name,
+                            arg_names=None,
+                        )
+                        self._current_func.calls.append(binop_call)
+                        self.analysis.call_graph[self._current_func.name].append(dunder_key)
+        self.generic_visit(node)
+
+
+def _post_process_decorator_replacements(analysis: ModuleAnalysis, tree: ast.Module) -> None:
+    """Detect decorator patterns where a function is replaced by a wrapper.
+
+    Pattern:
+        def slow_decorator(func):
+            def wrapper(*args, **kwargs):
+                time.sleep(2)
+                return func(*args, **kwargs)
+            return wrapper
+
+        @slow_decorator
+        def compute():
+            return 42
+
+    In this case, calling compute() actually calls wrapper().
+    """
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        # Check if this function is a decorator factory (defines and returns a nested func)
+        wrapper_name = None
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Check if this inner function is returned
+                for stmt in node.body:
+                    if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Name):
+                        if stmt.value.id == child.name:
+                            wrapper_name = child.name
+                            break
+
+        if not wrapper_name:
+            continue
+
+        # Now find all functions decorated with this decorator
+        decorator_name = node.name
+        for target in ast.iter_child_nodes(tree):
+            if not isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if target.name == decorator_name:
+                continue
+
+            for dec in target.decorator_list:
+                dec_name = None
+                if isinstance(dec, ast.Name):
+                    dec_name = dec.id
+                elif isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name):
+                    dec_name = dec.func.id
+
+                if dec_name == decorator_name:
+                    # target is decorated with our decorator -> it's replaced by wrapper
+                    analysis.decorator_replacements[target.name] = wrapper_name
+
+                    # Copy the wrapper's calls to the target function
+                    if wrapper_name in analysis.functions and target.name in analysis.functions:
+                        target_func = analysis.functions[target.name]
+                        wrapper_func = analysis.functions[wrapper_name]
+                        # Add all the wrapper's calls to the decorated function
+                        for call in wrapper_func.calls:
+                            target_func.calls.append(call)
 
 
 def analyze_file(filepath: str | Path) -> ModuleAnalysis:
@@ -341,6 +876,7 @@ def analyze_file(filepath: str | Path) -> ModuleAnalysis:
 
     builder = CallGraphBuilder(str(filepath))
     builder.visit(tree)
+    _post_process_decorator_replacements(builder.analysis, tree)
 
     return builder.analysis
 
@@ -350,4 +886,5 @@ def analyze_source(source: str, filepath: str = "<test>") -> ModuleAnalysis:
     tree = ast.parse(source, filename=filepath)
     builder = CallGraphBuilder(filepath)
     builder.visit(tree)
+    _post_process_decorator_replacements(builder.analysis, tree)
     return builder.analysis
