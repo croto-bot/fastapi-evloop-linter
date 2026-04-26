@@ -81,6 +81,9 @@ class ModuleAnalysis:
     class_properties: dict[str, set[str]] = field(default_factory=dict)
     # Module-level variable types: var_name -> class_name
     module_var_types: dict[str, str] = field(default_factory=dict)
+    # Source module for module-level vars constructed from `mod.Cls()`.
+    # var_name -> module name (e.g. q = queue.Queue() -> "q" -> "queue").
+    module_var_module: dict[str, str] = field(default_factory=dict)
     # Class attributes that reference known functions: class_name -> {attr_name: func_name}
     class_func_attrs: dict[str, dict[str, str]] = field(default_factory=dict)
 
@@ -105,30 +108,25 @@ class CallGraphBuilder(ast.NodeVisitor):
             return self._get_decorator_name(node.func)
         return ""
 
-    def _is_fastapi_endpoint(self, decorators: list[ast.expr]) -> bool:
-        """Check if function decorators indicate a FastAPI endpoint."""
-        fastapi_patterns = {
-            "app.get", "app.post", "app.put", "app.delete", "app.patch",
-            "app.head", "app.options", "app.route",
-            "router.get", "router.post", "router.put", "router.delete",
-            "router.patch", "router.head", "router.options", "router.route",
-            "api.get", "api.post", "api.put", "api.delete", "api.patch",
-        }
-        # Also match any .get/.post etc. on any variable (heuristic)
-        http_methods = {"get", "post", "put", "delete", "patch", "head", "options"}
+    def _infer_bare_name_module(self, name: str) -> str | None:
+        """For an unresolved bare name, see if any imported module exposes it.
 
-        for dec in decorators:
-            name = self._get_decorator_name(dec)
-            if name in fastapi_patterns:
-                return True
-            # Check for any_var.method pattern
-            parts = name.split(".")
-            if len(parts) == 2 and parts[1] in http_methods:
-                return True
-            # APIRouter() or FastAPI() instances with decorators
-            if len(parts) >= 2 and parts[-1] in http_methods:
-                return True
-        return False
+        Returns the module name if exactly one import has the attribute,
+        else None. Uses runtime introspection — no hardcoding.
+        """
+        from .introspect import attr_exists
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for imp in self.analysis.imports.values():
+            if imp.module in seen:
+                continue
+            seen.add(imp.module)
+            if attr_exists(imp.module, name):
+                candidates.append(imp.module)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
 
     def _resolve_call_name(self, node: ast.Call) -> tuple[str | None, str | None, str | None]:
         """Resolve a call to (module, func_name, object_type).
@@ -165,6 +163,14 @@ class CallGraphBuilder(ast.NodeVisitor):
                 call_key = f"{var_type}.__call__"
                 if call_key in self.analysis.functions:
                     return None, call_key, var_type
+            # Bare-name fallback: search imported modules via runtime introspection
+            # for an exported callable matching this name. e.g. `import time` then
+            # bare `sleep(5)` (semantically wrong but legal-looking) — we infer
+            # `time.sleep` if exactly one imported module exposes a `sleep` attr.
+            if name not in self.analysis.functions:
+                inferred = self._infer_bare_name_module(name)
+                if inferred is not None:
+                    return inferred, name, None
             return None, name, None
 
         elif isinstance(func, ast.Attribute):
@@ -198,36 +204,49 @@ class CallGraphBuilder(ast.NodeVisitor):
                         if attr_name in self.analysis.class_func_attrs[obj_type]:
                             real_func = self.analysis.class_func_attrs[obj_type][attr_name]
                             return None, real_func, None
-                    return None, attr_name, obj_type
-                # Check if we know the type of this variable
-                if self._current_func and base_name in self._current_func.var_types:
-                    obj_type = self._current_func.var_types[base_name]
-                    # Check if this is a class function attribute
-                    if obj_type in self.analysis.class_func_attrs:
-                        if attr_name in self.analysis.class_func_attrs[obj_type]:
-                            real_func = self.analysis.class_func_attrs[obj_type][attr_name]
-                            return None, real_func, None
-                    return None, attr_name, obj_type
-                # Check module-level var types
-                if base_name in self.analysis.module_var_types:
-                    obj_type = self.analysis.module_var_types[base_name]
-                    if obj_type in self.analysis.class_func_attrs:
-                        if attr_name in self.analysis.class_func_attrs[obj_type]:
-                            real_func = self.analysis.class_func_attrs[obj_type][attr_name]
-                            return None, real_func, None
-                    return None, attr_name, obj_type
-                # Check if base is a known variable from imports (e.g., lock = threading.Lock())
-                # Use the base_name as a fallback obj_type for blocking method detection
+                    # If we know the source module of this var (from
+                    # `q = queue.Queue()` or `from queue import Queue`), propagate
+                    # it so the classifier can verify the method on that class.
+                    src_mod = self.analysis.module_var_module.get(base_name)
+                    return src_mod, attr_name, obj_type
+                # Fallback: use base_name as obj_type for blocking method detection.
                 return None, attr_name, base_name
 
-            if isinstance(value, ast.Attribute):
-                inner_attr = value.attr
-                inner_value = value.value
-                if isinstance(inner_value, ast.Name):
-                    base = inner_value.id
+            elif isinstance(value, ast.Attribute):
+                # Nested: a.b.method() or a.b.c.method()
+                # Walk down to leftmost Name and reconstruct the dotted path.
+                parts: list[str] = [value.attr]
+                cur: ast.expr = value.value
+                while isinstance(cur, ast.Attribute):
+                    parts.insert(0, cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    base = cur.id
+                    # Try matching the longest dotted-import prefix:
+                    # `import urllib.request` registers key 'urllib.request',
+                    # so for urllib.request.urlopen we want module='urllib.request'.
+                    candidate_keys = []
                     if base in self.analysis.imports:
-                        imp = self.analysis.imports[base]
-                        return f"{imp.module}.{inner_attr}", attr_name, None
+                        candidate_keys.append((base, []))
+                    # Also consider keys like 'urllib.request' that start with this base.
+                    for key in self.analysis.imports:
+                        if key.split(".")[0] == base and "." in key:
+                            candidate_keys.append((key, key.split(".")[1:]))
+                    # Prefer the longest matching prefix that aligns with parts.
+                    best: tuple[str, list[str]] | None = None
+                    for key, key_tail in candidate_keys:
+                        if key_tail == parts[: len(key_tail)]:
+                            if best is None or len(key_tail) > len(best[1]):
+                                best = (key, key_tail)
+                    if best is not None:
+                        key, key_tail = best
+                        imp = self.analysis.imports[key]
+                        remaining = parts[len(key_tail) :]
+                        if remaining:
+                            mod_path = imp.module + "." + ".".join(remaining)
+                        else:
+                            mod_path = imp.module
+                        return mod_path, attr_name, None
                 return None, attr_name, None
 
             elif isinstance(value, ast.Call):
@@ -235,12 +254,11 @@ class CallGraphBuilder(ast.NodeVisitor):
                 # Try to resolve the call target
                 inner = self._resolve_call_name(value)
                 if inner and inner[1]:
-                    # If inner is a known blocking module's function, the method
-                    # call on its result is also likely blocking (e.g., requests.Session().get())
-                    if inner[0] and inner[0] in ("requests",):
-                        # e.g., requests.Session().get() -> module=requests, func=get
-                        return inner[0], attr_name, inner[1]
-                    return None, attr_name, inner[1]
+                    # Propagate the module unconditionally: if the inner call has
+                    # a module, the chained method is called on its return value —
+                    # preserve module+class so the classifier can introspect.
+                    # e.g., requests.Session().get() -> (requests, get, Session)
+                    return inner[0], attr_name, inner[1]
 
             return None, attr_name, None
 
@@ -322,25 +340,16 @@ class CallGraphBuilder(ast.NodeVisitor):
         if isinstance(value, ast.NamedExpr):
             self._track_var_alias(var_name, value.value)
 
-        # functools.partial: wait = partial(time.sleep, 1)
+        # Generic callable wrapper: any ast.Call whose first positional arg
+        # resolves to a (module, func_name) reference.
+        # Covers functools.partial, custom wrappers, etc.
         if isinstance(value, ast.Call):
-            if isinstance(value.func, ast.Name) and value.func.id == "partial":
-                if value.args:
-                    first_arg = value.args[0]
-                    if isinstance(first_arg, ast.Attribute):
-                        attr_name = first_arg.attr
-                        if isinstance(first_arg.value, ast.Name):
-                            base = first_arg.value.id
-                            if base in self.analysis.imports:
-                                imp = self.analysis.imports[base]
-                                self._current_func.var_aliases[var_name] = (imp.module, attr_name)
-                                return
-                    if isinstance(first_arg, ast.Name):
-                        ref = first_arg.id
-                        if ref in self.analysis.import_froms:
-                            imp = self.analysis.import_froms[ref]
-                            self._current_func.var_aliases[var_name] = (imp.module, imp.name)
-                            return
+            if value.args:
+                first_arg = value.args[0]
+                resolved = self._resolve_blocking_ref(first_arg)
+                if resolved:
+                    self._current_func.var_aliases[var_name] = resolved
+                    return
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -379,6 +388,21 @@ class CallGraphBuilder(ast.NodeVisitor):
             params.append(args.kwarg.arg)
         return params
 
+    def _visit_function_body(self, node: ast.AsyncFunctionDef | ast.FunctionDef) -> None:
+        """Visit function args + body but NOT decorator_list.
+
+        Decorators are part of the surrounding scope, not the function body —
+        recording them as calls inside the function would attribute decorator
+        side effects (e.g. `@app.get("/x")`) to the function being decorated.
+        """
+        for arg_default in node.args.defaults:
+            self.visit(arg_default)
+        for arg_default in node.args.kw_defaults:
+            if arg_default is not None:
+                self.visit(arg_default)
+        for stmt in node.body:
+            self.visit(stmt)
+
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         func = FuncDef(
             name=node.name,
@@ -387,13 +411,14 @@ class CallGraphBuilder(ast.NodeVisitor):
             decorators=[self._get_decorator_name(d) for d in node.decorator_list],
             params=self._extract_params(node),
         )
-        is_endpoint = self._is_fastapi_endpoint(node.decorator_list)
+        from .endpoints import is_async_endpoint as _is_async_endpoint
+        is_endpoint = _is_async_endpoint(node, node.decorator_list, self.analysis)
 
         prev = self._current_func
         self._current_func = func
         self._scope_stack.append(func)
 
-        self.generic_visit(node)
+        self._visit_function_body(node)
 
         self._scope_stack.pop()
         self._current_func = prev
@@ -417,7 +442,7 @@ class CallGraphBuilder(ast.NodeVisitor):
         self._current_func = func
         self._scope_stack.append(func)
 
-        self.generic_visit(node)
+        self._visit_function_body(node)
 
         self._scope_stack.pop()
         self._current_func = prev
@@ -425,10 +450,11 @@ class CallGraphBuilder(ast.NodeVisitor):
         # Store function - but check if a decorator wrapper already took this name
         self.analysis.functions[node.name] = func
 
-        # Check if this function is a decorator wrapper that replaces the original
-        # Pattern: a function defined inside another function and returned as decorator result
-        if self._current_func and node.name == "wrapper":
-            # This wrapper might replace a decorated function
+        # Check if this function is a decorator wrapper that replaces the original.
+        # Pattern: any inner function returned by its enclosing function is a wrapper —
+        # the name "wrapper" is not required; _post_process_decorator_replacements handles
+        # this structurally. Mark is_decorator_wrapper for any nested function definition.
+        if self._current_func:
             self._current_func.is_decorator_wrapper = True
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -456,7 +482,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                     prev = self._current_func
                     self._current_func = prop_func
                     self._scope_stack.append(prop_func)
-                    self.generic_visit(item)
+                    self._visit_function_body(item)
                     self._scope_stack.pop()
                     self._current_func = prev
                     self.analysis.functions[prop_key] = prop_func
@@ -482,7 +508,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                         prev = self._current_func
                         self._current_func = dunder_func
                         self._scope_stack.append(dunder_func)
-                        self.generic_visit(item)
+                        self._visit_function_body(item)
                         self._scope_stack.pop()
                         self._current_func = prev
 
@@ -499,7 +525,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                         )
                         self._current_func = method_func
                         self._scope_stack.append(method_func)
-                        self.generic_visit(item)
+                        self._visit_function_body(item)
                         self._scope_stack.pop()
                         self._current_func = prev
                         self.analysis.functions[item.name] = method_func
@@ -525,9 +551,6 @@ class CallGraphBuilder(ast.NodeVisitor):
             if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.visit(item)
 
-        # Track module-level variable assignments to this class
-        # (e.g., cfg = Config() at module level)
-        self._track_module_level_class_vars(node.name)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         """Track walrus operator assignments: (x := value)."""
@@ -608,12 +631,37 @@ class CallGraphBuilder(ast.NodeVisitor):
                 self._current_func.calls.append(pi_call)
                 self.analysis.call_graph[self._current_func.name].append(postinit_key)
 
-        # Handle map(func, items) as higher-order caller
-        if isinstance(node.func, ast.Name) and node.func.id == "map" and len(node.args) >= 2:
-            func_arg = node.args[0]
-            if isinstance(func_arg, ast.Name):
-                map_callee_call = CallSite(
-                    name=func_arg.id,
+        # Generic higher-order call: for any call, if a positional ast.Name arg
+        # refers to a known function or imported name, add a synthetic CallSite
+        # so the checker traces into it (covers map, filter, executor.submit, etc.).
+        # - For local functions: only add when the call target itself is NOT a
+        #   local function (builtins like map/filter won't trigger _trace_callback_args).
+        # - For imported names: always add (they are never reached via arg_names).
+        caller_is_local = (
+            isinstance(node.func, ast.Name)
+            and node.func.id in self.analysis.functions
+        )
+        for hof_arg in node.args:
+            if not isinstance(hof_arg, ast.Name):
+                continue
+            hof_name = hof_arg.id
+            if hof_name in self.analysis.import_froms:
+                imp = self.analysis.import_froms[hof_name]
+                hof_call = CallSite(
+                    name=imp.name,
+                    line=node.lineno,
+                    col=node.col_offset,
+                    module=imp.module,
+                    object_type=None,
+                    caller_function=self._current_func.name,
+                    arg_names=None,
+                )
+                self._current_func.calls.append(hof_call)
+                self.analysis.call_graph[self._current_func.name].append(imp.name)
+            elif hof_name in self.analysis.functions and not caller_is_local:
+                # Local function passed to a non-local caller (e.g. map, list, etc.)
+                hof_call = CallSite(
+                    name=hof_name,
                     line=node.lineno,
                     col=node.col_offset,
                     module=None,
@@ -621,32 +669,34 @@ class CallGraphBuilder(ast.NodeVisitor):
                     caller_function=self._current_func.name,
                     arg_names=None,
                 )
-                # Add as a proper call site so the checker traces into it
-                self._current_func.calls.append(map_callee_call)
-                self.analysis.call_graph[self._current_func.name].append(func_arg.id)
+                self._current_func.calls.append(hof_call)
+                self.analysis.call_graph[self._current_func.name].append(hof_name)
 
-        # Handle filter(func, items) as higher-order caller
-        if isinstance(node.func, ast.Name) and node.func.id == "filter" and len(node.args) >= 2:
-            func_arg = node.args[0]
-            if isinstance(func_arg, ast.Name):
-                filter_callee_call = CallSite(
-                    name=func_arg.id,
-                    line=node.lineno,
-                    col=node.col_offset,
-                    module=None,
-                    object_type=None,
-                    caller_function=self._current_func.name,
-                    arg_names=None,
+        # Generic higher-order keyword args: catch sorted(items, key=fn),
+        # min(items, key=fn), max(items, key=fn) etc., where the callable is
+        # passed as a keyword. Same shape as the positional case above.
+        for kw in node.keywords:
+            if not isinstance(kw.value, ast.Name):
+                continue
+            kw_name = kw.value.id
+            if kw_name in self.analysis.import_froms:
+                imp = self.analysis.import_froms[kw_name]
+                self._current_func.calls.append(
+                    CallSite(
+                        name=imp.name,
+                        line=node.lineno,
+                        col=node.col_offset,
+                        module=imp.module,
+                        object_type=None,
+                        caller_function=self._current_func.name,
+                        arg_names=None,
+                    )
                 )
-                self._current_func.calls.append(filter_callee_call)
-                self.analysis.call_graph[self._current_func.name].append(func_arg.id)
-
-        # Handle sorted(items, key=func) as higher-order caller
-        if isinstance(node.func, ast.Name) and node.func.id == "sorted":
-            for kw in node.keywords:
-                if kw.arg == "key" and isinstance(kw.value, ast.Name):
-                    sorted_callee_call = CallSite(
-                        name=kw.value.id,
+                self.analysis.call_graph[self._current_func.name].append(imp.name)
+            elif kw_name in self.analysis.functions and not caller_is_local:
+                self._current_func.calls.append(
+                    CallSite(
+                        name=kw_name,
                         line=node.lineno,
                         col=node.col_offset,
                         module=None,
@@ -654,8 +704,8 @@ class CallGraphBuilder(ast.NodeVisitor):
                         caller_function=self._current_func.name,
                         arg_names=None,
                     )
-                    self._current_func.calls.append(sorted_callee_call)
-                    self.analysis.call_graph[self._current_func.name].append(kw.value.id)
+                )
+                self.analysis.call_graph[self._current_func.name].append(kw_name)
 
         self.generic_visit(node)
 
@@ -703,9 +753,21 @@ class CallGraphBuilder(ast.NodeVisitor):
                     func = node.value.func
                     if isinstance(func, ast.Name):
                         self.analysis.module_var_types[target.id] = func.id
+                        # If the called name was from-imported, remember its module
+                        # so a method call on `target` can resolve to that module.
+                        if func.id in self.analysis.import_froms:
+                            self.analysis.module_var_module[target.id] = (
+                                self.analysis.import_froms[func.id].module
+                            )
                     elif isinstance(func, ast.Attribute):
-                        # e.g., q = queue.Queue() -> type=Queue
+                        # e.g., q = queue.Queue() -> type=Queue, source module=queue
                         self.analysis.module_var_types[target.id] = func.attr
+                        if isinstance(func.value, ast.Name):
+                            base = func.value.id
+                            if base in self.analysis.imports:
+                                self.analysis.module_var_module[target.id] = (
+                                    self.analysis.imports[base].module
+                                )
         self.generic_visit(node)
 
     def visit_With(self, node: ast.With) -> None:
@@ -822,13 +884,6 @@ class CallGraphBuilder(ast.NodeVisitor):
                 return (imp.module, None)
         return None
 
-    def _track_module_level_class_vars(self, class_name: str) -> None:
-        """Track module-level variables of this class type (best effort)."""
-        # This is called after the class is defined
-        # We look for patterns like: cfg = Config() at module level
-        # These were already tracked in visit_Assign if at module level
-        pass
-
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Track attribute access for property detection."""
         if self._current_func and isinstance(node.value, ast.Name):
@@ -864,17 +919,6 @@ class CallGraphBuilder(ast.NodeVisitor):
             # This is handled in visit_Call via _resolve_call_name
 
         self.generic_visit(node)
-
-    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
-        """Track loop variable types."""
-        if self._current_func and isinstance(node.target, ast.Name):
-            # e.g., for item in some_list: - can't easily infer type
-            pass
-        self.generic_visit(node)
-
-    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-        """Track loop variable types."""
-        self.visit_For(node)
 
     def visit_BinOp(self, node: ast.BinOp) -> None:
         """Track operator overloading: d * 5 -> Delay.__mul__."""
