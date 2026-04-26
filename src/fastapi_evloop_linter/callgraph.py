@@ -24,6 +24,8 @@ class CallSite:
     object_type: str | None = None  # Object type for method calls (e.g., "Path")
     # The function this call is inside
     caller_function: str | None = None
+    # Function names passed as positional arguments (None for non-Name args)
+    arg_names: list[str | None] = field(default_factory=list)
 
 
 @dataclass
@@ -36,6 +38,8 @@ class FuncDef:
     decorators: list[str] = field(default_factory=list)
     # Variables tracked for type inference
     var_types: dict[str, str] = field(default_factory=dict)
+    # Parameter names (for callback resolution)
+    params: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -118,7 +122,8 @@ class CallGraphBuilder(ast.NodeVisitor):
                 return imp.module, None, None  # module.method()
             if name in self.analysis.import_froms:
                 imp = self.analysis.import_froms[name]
-                return imp.module, name, None
+                # Return the ORIGINAL name (not alias) so blocker lookup works
+                return imp.module, imp.name, None
             return None, name, None
 
         elif isinstance(func, ast.Attribute):
@@ -154,11 +159,16 @@ class CallGraphBuilder(ast.NodeVisitor):
                 return None, attr_name, None
 
             elif isinstance(value, ast.Call):
-                # Chained: SomeClass().method()
+                # Chained: SomeClass().method() or module.Func().method()
                 # Try to resolve the call target
-                inner_name = self._resolve_call_name(value)
-                if inner_name and inner_name[1]:
-                    return None, attr_name, inner_name[1]
+                inner = self._resolve_call_name(value)
+                if inner and inner[1]:
+                    # If inner is a known blocking module's function, the method
+                    # call on its result is also likely blocking (e.g., requests.Session().get())
+                    if inner[0] and inner[0] in ("requests",):
+                        # e.g., requests.Session().get() -> module=requests, func=get
+                        return inner[0], attr_name, inner[1]
+                    return None, attr_name, inner[1]
 
             return None, attr_name, None
 
@@ -206,12 +216,27 @@ class CallGraphBuilder(ast.NodeVisitor):
             self.analysis.import_froms[key] = info
         self.generic_visit(node)
 
+    def _extract_params(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+        """Extract parameter names from a function definition."""
+        params = []
+        args = node.args
+        for arg in args.args:
+            params.append(arg.arg)
+        if args.vararg:
+            params.append(args.vararg.arg)
+        for arg in args.kwonlyargs:
+            params.append(arg.arg)
+        if args.kwarg:
+            params.append(args.kwarg.arg)
+        return params
+
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         func = FuncDef(
             name=node.name,
             is_async=True,
             node=node,
             decorators=[self._get_decorator_name(d) for d in node.decorator_list],
+            params=self._extract_params(node),
         )
         is_endpoint = self._is_fastapi_endpoint(node.decorator_list)
 
@@ -236,6 +261,7 @@ class CallGraphBuilder(ast.NodeVisitor):
             is_async=False,
             node=node,
             decorators=[self._get_decorator_name(d) for d in node.decorator_list],
+            params=self._extract_params(node),
         )
 
         prev = self._current_func
@@ -260,6 +286,14 @@ class CallGraphBuilder(ast.NodeVisitor):
             self.generic_visit(node)
             return
 
+        # Extract Name arguments (for callback/function-reference tracking)
+        # Use None for non-Name args to preserve positional alignment
+        arg_names: list[str | None] = []
+        for arg in node.args:
+            if isinstance(arg, ast.Name):
+                arg_names.append(arg.id)
+            else:
+                arg_names.append(None)
         call_site = CallSite(
             name=func_name,
             line=node.lineno,
@@ -267,6 +301,7 @@ class CallGraphBuilder(ast.NodeVisitor):
             module=module,
             object_type=obj_type,
             caller_function=self._current_func.name,
+            arg_names=arg_names,
         )
 
         self._current_func.calls.append(call_site)

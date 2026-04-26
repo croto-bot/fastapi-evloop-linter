@@ -1,0 +1,7 @@
+- id: fastapi-evloop-linter
+  name: fastapi-evloop-linter
+  description: Detect event loop blocking calls in FastAPI async endpoints
+  entry: fastapi-evloop-linter
+  language: python
+  types: [python]
+  require_serial: true

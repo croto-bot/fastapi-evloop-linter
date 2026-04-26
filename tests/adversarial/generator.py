@@ -51,6 +51,12 @@ def generate_all_cases() -> list[TestCase]:
     cases.extend(_nested_import_cases())
     cases.extend(_type_inference_cases())
     cases.extend(_callback_pattern_cases())
+    cases.extend(_router_decorator_cases())
+    cases.extend(_multiple_blocking_cases())
+    cases.extend(_deep_chain_7_cases())
+    cases.extend(_callback_deep_cases())
+    cases.extend(_open_builtin_cases())
+    cases.extend(_aliased_module_cases())
     return cases
 
 
@@ -616,6 +622,278 @@ def _callback_pattern_cases() -> list[TestCase]:
             expected_min_depth=2,
             category="callback",
             description="Blocking call inside callback passed to helper (very hard to detect statically)",
+        ),
+    ]
+
+
+def _router_decorator_cases() -> list[TestCase]:
+    """Cases using APIRouter instead of app."""
+    return [
+        TestCase(
+            name="router_decorator",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import APIRouter
+                router = APIRouter()
+
+                @router.get("/items")
+                async def list_items():
+                    time.sleep(1)
+                    return []
+            """),
+            difficulty=2,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="router_decorator",
+            description="Blocking call in router-decorated endpoint",
+        ),
+        TestCase(
+            name="router_deep",
+            source=textwrap.dedent("""\
+                import requests
+                from fastapi import APIRouter
+                router = APIRouter()
+
+                def get_data():
+                    return requests.get("https://api.example.com")
+
+                @router.post("/submit")
+                async def submit():
+                    data = get_data()
+                    return {"ok": True}
+            """),
+            difficulty=4,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="router_decorator",
+            description="Deep blocking call in router endpoint",
+        ),
+    ]
+
+
+def _multiple_blocking_cases() -> list[TestCase]:
+    """Cases with multiple blocking calls in a single function."""
+    return [
+        TestCase(
+            name="multi_blocking_one_func",
+            source=textwrap.dedent("""\
+                import time
+                import requests
+                import subprocess
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/heavy")
+                async def heavy():
+                    time.sleep(1)
+                    resp = requests.get("https://example.com")
+                    subprocess.run(["echo", "hello"])
+                    return {"ok": True}
+            """),
+            difficulty=1,
+            expected_violations=3,
+            expected_min_depth=0,
+            category="multi_blocking",
+            description="Three different blocking calls in one endpoint",
+        ),
+        TestCase(
+            name="multi_blocking_deep",
+            source=textwrap.dedent("""\
+                import time
+                import requests
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def wait():
+                    time.sleep(1)
+
+                def fetch():
+                    requests.get("https://example.com")
+
+                @app.get("/multi-deep")
+                async def multi_deep():
+                    wait()
+                    fetch()
+                    return {"ok": True}
+            """),
+            difficulty=3,
+            expected_violations=2,
+            expected_min_depth=1,
+            category="multi_blocking",
+            description="Two blocking wrappers called from one endpoint",
+        ),
+    ]
+
+
+def _deep_chain_7_cases() -> list[TestCase]:
+    """Very deep call chains (7+ levels)."""
+    return [
+        TestCase(
+            name="depth_7_chain",
+            source=textwrap.dedent("""\
+                import os
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def l7(): os.system("echo deep")
+                def l6(): l7()
+                def l5(): l6()
+                def l4(): l5()
+                def l3(): l4()
+                def l2(): l3()
+                def l1(): l2()
+
+                @app.get("/d7")
+                async def d7():
+                    l1()
+                    return {"ok": True}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=7,
+            category="deep_chain_7",
+            description="os.system at depth 7",
+        ),
+    ]
+
+
+def _callback_deep_cases() -> list[TestCase]:
+    """Callback patterns with deeper nesting."""
+    return [
+        TestCase(
+            name="callback_deep",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def runner(fn, val):
+                    return fn(val)
+
+                def blocker(x):
+                    time.sleep(x)
+                    return x
+
+                @app.get("/cb-deep")
+                async def cb_deep():
+                    result = runner(blocker, 5)
+                    return {"result": result}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=2,
+            category="callback_deep",
+            description="time.sleep in callback passed through runner",
+        ),
+        TestCase(
+            name="callback_with_extra_args",
+            source=textwrap.dedent("""\
+                import requests
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def map_fn(items, transform):
+                    return [transform(i) for i in items]
+
+                def fetch_item(i):
+                    return requests.get(f"https://api.example.com/items/{i}")
+
+                @app.get("/map-cb")
+                async def map_cb():
+                    results = map_fn([1, 2, 3], fetch_item)
+                    return {"count": len(results)}
+            """),
+            difficulty=9,
+            expected_violations=1,
+            expected_min_depth=2,
+            category="callback_deep",
+            description="requests.get inside callback used in map-like function",
+        ),
+    ]
+
+
+def _open_builtin_cases() -> list[TestCase]:
+    """Cases using builtin open() for file I/O."""
+    return [
+        TestCase(
+            name="builtin_open",
+            source=textwrap.dedent("""\
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/read")
+                async def read_data():
+                    with open("/tmp/data.txt") as f:
+                        return f.read()
+            """),
+            difficulty=2,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="builtin_open",
+            description="builtin open() in endpoint",
+        ),
+        TestCase(
+            name="open_in_helper",
+            source=textwrap.dedent("""\
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def load_file(path):
+                    with open(path) as f:
+                        return f.read()
+
+                @app.get("/load")
+                async def load():
+                    data = load_file("/tmp/config.yaml")
+                    return {"data": data}
+            """),
+            difficulty=3,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="builtin_open",
+            description="open() inside helper function",
+        ),
+    ]
+
+
+def _aliased_module_cases() -> list[TestCase]:
+    """More aliased import patterns."""
+    return [
+        TestCase(
+            name="aliased_os",
+            source=textwrap.dedent("""\
+                import os as operating_system
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/cmd")
+                async def run_cmd():
+                    operating_system.system("ls")
+                    return {"ok": True}
+            """),
+            difficulty=3,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="aliased_module",
+            description="os imported as operating_system",
+        ),
+        TestCase(
+            name="aliased_time",
+            source=textwrap.dedent("""\
+                import time as t
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                @app.get("/wait")
+                async def wait():
+                    t.sleep(10)
+                    return {"ok": True}
+            """),
+            difficulty=3,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="aliased_module",
+            description="time imported as t",
         ),
     ]
 

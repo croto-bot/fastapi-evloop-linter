@@ -130,5 +130,11 @@ def is_blocking_call(
             # Function call: match on module if we have it
             if module is None or bp.module == module:
                 return bp
+        elif object_type and not bp.object_type:
+            # Call has object_type but pattern doesn't (e.g., requests.Session().get() vs requests.get)
+            # If module matches, still consider it a match since the method is on
+            # an object from a known blocking module
+            if module is not None and bp.module == module:
+                return bp
 
     return None

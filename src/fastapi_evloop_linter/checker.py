@@ -172,6 +172,20 @@ class EventLoopChecker:
                     visited=visited.copy(),  # Allow re-visiting from different paths
                 )
 
+                # Also trace any function names passed as arguments (callback pattern)
+                # If callee has parameters and one of the arg_names is a known function,
+                # and callee calls one of its parameters, follow the argument function too.
+                if callee_func.params and call.arg_names:
+                    self._trace_callback_args(
+                        analysis=analysis,
+                        callee_func=callee_func,
+                        arg_names=call.arg_names,
+                        call_chain=new_chain,
+                        depth=depth + 1,
+                        visited=visited.copy(),
+                        result=result,
+                    )
+
     def check_directory(self, dirpath: str | Path) -> LintResult:
         """Check all Python files in a directory recursively."""
         dirpath = Path(dirpath)
@@ -182,6 +196,48 @@ class EventLoopChecker:
             result.merge(file_result)
 
         return result
+
+    def _trace_callback_args(
+        self,
+        analysis: ModuleAnalysis,
+        callee_func: FuncDef,
+        arg_names: list[str | None],
+        call_chain: list[str],
+        depth: int,
+        visited: set[str],
+        result: LintResult,
+    ) -> None:
+        """Trace function references passed as arguments into a callee.
+
+        If callee_func calls one of its parameters, and that parameter maps to
+        a function name in arg_names, trace through that function too.
+        """
+        if depth > self.max_depth:
+            return
+
+        # Build a mapping of parameter position to arg_name
+        params = callee_func.params
+        param_to_arg: dict[str, str] = {}
+        for i, param in enumerate(params):
+            if i < len(arg_names) and arg_names[i] is not None:
+                param_to_arg[param] = arg_names[i]
+
+        # Check if callee calls any of its parameters
+        for call in callee_func.calls:
+            # If the call name matches a parameter, follow the mapped arg function
+            if call.name in param_to_arg:
+                actual_func_name = param_to_arg[call.name]
+                actual_func = analysis.functions.get(actual_func_name)
+                if actual_func is not None:
+                    new_chain = call_chain + [actual_func_name]
+                    self._trace_calls(
+                        analysis=analysis,
+                        func=actual_func,
+                        result=result,
+                        call_chain=new_chain,
+                        depth=depth + 1,
+                        visited=visited.copy(),
+                    )
 
 
 def format_violation(v: Violation) -> str:
