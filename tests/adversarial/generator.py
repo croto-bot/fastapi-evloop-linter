@@ -63,6 +63,11 @@ def generate_all_cases() -> list[TestCase]:
     cases.extend(_blocking_constructor_cases())
     cases.extend(_higher_order_cases())
     cases.extend(_property_blocking_cases())
+    cases.extend(_higher_order_extra_cases())
+    cases.extend(_async_dunder_cases())
+    cases.extend(_class_attr_cases())
+    cases.extend(_decorator_factory_cases())
+    cases.extend(_stdlib_blocking_cases())
     return cases
 
 
@@ -1329,6 +1334,204 @@ def _property_blocking_cases() -> list[TestCase]:
             expected_min_depth=0,
             category="blocking_property",
             description="Property that makes blocking HTTP request",
+        ),
+    ]
+
+
+def _higher_order_extra_cases() -> list[TestCase]:
+    """Cases with filter/sorted/list.sort as higher-order callers."""
+    return [
+        TestCase(
+            name="filter_blocking",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def is_ready(item):
+                    time.sleep(0.1)
+                    return item > 0
+
+                @app.get("/filter")
+                async def filter_endpoint():
+                    results = list(filter(is_ready, [1, -2, 3]))
+                    return {"count": len(results)}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="higher_order_extra",
+            description="filter() with blocking predicate",
+        ),
+        TestCase(
+            name="sorted_blocking",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def slow_key(item):
+                    time.sleep(0.1)
+                    return item["score"]
+
+                @app.get("/sorted")
+                async def sorted_endpoint():
+                    results = sorted([{"score": 1}, {"score": 2}], key=slow_key)
+                    return {"results": results}
+            """),
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="higher_order_extra",
+            description="sorted() with blocking key function",
+        ),
+    ]
+
+
+def _async_dunder_cases() -> list[TestCase]:
+    """Cases with async context managers (__aenter__)."""
+    return [
+        TestCase(
+            name="async_context_manager",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class AsyncTimer:
+                    async def __aenter__(self):
+                        time.sleep(1)
+                        return self
+                    async def __aexit__(self, *args):
+                        pass
+
+                @app.get("/actx")
+                async def actx_endpoint():
+                    async with AsyncTimer():
+                        pass
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="async_dunder",
+            description="Blocking call in __aenter__ of async context manager",
+        ),
+    ]
+
+
+def _class_attr_cases() -> list[TestCase]:
+    """Cases where blocking functions are stored as class attributes."""
+    return [
+        TestCase(
+            name="class_attr_blocking",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def wait():
+                    time.sleep(1)
+
+                class Runner:
+                    action = wait
+
+                r = Runner()
+
+                @app.get("/class-attr")
+                async def class_attr_endpoint():
+                    r.action()
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_attr",
+            description="Blocking function stored as class attribute",
+        ),
+    ]
+
+
+def _decorator_factory_cases() -> list[TestCase]:
+    """Cases with decorator factories (decorators with arguments)."""
+    return [
+        TestCase(
+            name="decorator_with_args",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def retry(n):
+                    def decorator(func):
+                        def wrapper(*args, **kwargs):
+                            for _ in range(n):
+                                time.sleep(1)
+                            return func(*args, **kwargs)
+                        return wrapper
+                    return decorator
+
+                @retry(3)
+                def fetch():
+                    return 42
+
+                @app.get("/retry")
+                async def retry_endpoint():
+                    result = fetch()
+                    return {"result": result}
+            """),
+            difficulty=9,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="decorator_factory",
+            description="Decorator with arguments that adds blocking calls",
+        ),
+    ]
+
+
+def _stdlib_blocking_cases() -> list[TestCase]:
+    """Cases with stdlib blocking patterns not yet in the blockers registry."""
+    return [
+        TestCase(
+            name="queue_get",
+            source=textwrap.dedent("""\
+                import queue
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                q = queue.Queue()
+
+                @app.get("/queue")
+                async def queue_endpoint():
+                    item = q.get()
+                    return {"item": item}
+            """),
+            difficulty=5,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="stdlib_blocking",
+            description="queue.Queue.get() blocks the event loop",
+        ),
+        TestCase(
+            name="lock_acquire",
+            source=textwrap.dedent("""\
+                import threading
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                lock = threading.Lock()
+
+                @app.get("/lock")
+                async def lock_endpoint():
+                    lock.acquire()
+                    lock.release()
+                    return {"ok": True}
+            """),
+            difficulty=5,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="stdlib_blocking",
+            description="threading.Lock.acquire() blocks the event loop",
         ),
     ]
 

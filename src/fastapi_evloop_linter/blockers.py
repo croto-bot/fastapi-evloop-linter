@@ -95,6 +95,19 @@ BLOCKING_PATTERNS: list[BlockingPattern] = [
     # redis sync
     BlockingPattern("redis", "Redis", "function", "error", "redis.Redis is synchronous; use redis.asyncio.Redis"),
     BlockingPattern("redis", "StrictRedis", "function", "error", "redis.StrictRedis is synchronous"),
+    # queue module (blocking)
+    BlockingPattern("queue", "Queue", "function", "error", "queue.Queue is synchronous; use asyncio.Queue"),
+    BlockingPattern("queue", "get", "method", "error", "queue.get() blocks; use asyncio.Queue.get", "Queue"),
+    BlockingPattern("queue", "put", "method", "error", "queue.put() blocks; use asyncio.Queue.put", "Queue"),
+    # threading blocking primitives
+    BlockingPattern("threading", "Lock", "function", "error", "threading.Lock blocks; use asyncio.Lock"),
+    BlockingPattern("threading", "acquire", "method", "error", "Lock.acquire() blocks the event loop; use asyncio.Lock.acquire", "Lock"),
+    BlockingPattern("threading", "RLock", "function", "error", "threading.RLock blocks; use asyncio.Lock"),
+    BlockingPattern("threading", "Event", "function", "error", "threading.Event blocks; use asyncio.Event"),
+    BlockingPattern("threading", "Condition", "function", "error", "threading.Condition blocks; use asyncio.Condition"),
+    BlockingPattern("threading", "Semaphore", "function", "error", "threading.Semaphore blocks; use asyncio.Semaphore"),
+    BlockingPattern("threading", "Barrier", "function", "error", "threading.Barrier blocks"),
+    BlockingPattern("threading", "join", "method", "error", "Thread.join() blocks; use asyncio tasks", "Thread"),
 ]
 
 # Build lookup dicts for fast matching

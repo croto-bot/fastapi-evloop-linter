@@ -81,6 +81,8 @@ class ModuleAnalysis:
     class_properties: dict[str, set[str]] = field(default_factory=dict)
     # Module-level variable types: var_name -> class_name
     module_var_types: dict[str, str] = field(default_factory=dict)
+    # Class attributes that reference known functions: class_name -> {attr_name: func_name}
+    class_func_attrs: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 class CallGraphBuilder(ast.NodeVisitor):
@@ -183,11 +185,42 @@ class CallGraphBuilder(ast.NodeVisitor):
                 # Check if we know the type of this variable
                 if self._current_func and base_name in self._current_func.var_types:
                     obj_type = self._current_func.var_types[base_name]
+                    # Check if this is a class function attribute
+                    if obj_type in self.analysis.class_func_attrs:
+                        if attr_name in self.analysis.class_func_attrs[obj_type]:
+                            real_func = self.analysis.class_func_attrs[obj_type][attr_name]
+                            return None, real_func, None
                     return None, attr_name, obj_type
+                # Check module-level var types
+                if base_name in self.analysis.module_var_types:
+                    obj_type = self.analysis.module_var_types[base_name]
+                    if obj_type in self.analysis.class_func_attrs:
+                        if attr_name in self.analysis.class_func_attrs[obj_type]:
+                            real_func = self.analysis.class_func_attrs[obj_type][attr_name]
+                            return None, real_func, None
+                    return None, attr_name, obj_type
+                # Check if we know the type of this variable
+                if self._current_func and base_name in self._current_func.var_types:
+                    obj_type = self._current_func.var_types[base_name]
+                    # Check if this is a class function attribute
+                    if obj_type in self.analysis.class_func_attrs:
+                        if attr_name in self.analysis.class_func_attrs[obj_type]:
+                            real_func = self.analysis.class_func_attrs[obj_type][attr_name]
+                            return None, real_func, None
+                    return None, attr_name, obj_type
+                # Check module-level var types
+                if base_name in self.analysis.module_var_types:
+                    obj_type = self.analysis.module_var_types[base_name]
+                    if obj_type in self.analysis.class_func_attrs:
+                        if attr_name in self.analysis.class_func_attrs[obj_type]:
+                            real_func = self.analysis.class_func_attrs[obj_type][attr_name]
+                            return None, real_func, None
+                    return None, attr_name, obj_type
+                # Check if base is a known variable from imports (e.g., lock = threading.Lock())
+                # Use the base_name as a fallback obj_type for blocking method detection
                 return None, attr_name, base_name
 
-            elif isinstance(value, ast.Attribute):
-                # Nested: a.b.method()
+            if isinstance(value, ast.Attribute):
                 inner_attr = value.attr
                 inner_value = value.value
                 if isinstance(inner_value, ast.Name):
@@ -238,6 +271,13 @@ class CallGraphBuilder(ast.NodeVisitor):
 
                 elif isinstance(func, ast.Attribute):
                     self._current_func.var_types[target.id] = func.attr
+                    # Also check if this is module.ClassName() pattern
+                    # e.g., q = queue.Queue() -> need to track module context
+                    if isinstance(func.value, ast.Name):
+                        base = func.value.id
+                        if base in self.analysis.imports:
+                            # Store as "module.ClassName" for richer matching
+                            pass
 
             # Track variable aliasing to blocking functions
             # e.g. f = time.sleep  or  f = requests.get
@@ -467,6 +507,19 @@ class CallGraphBuilder(ast.NodeVisitor):
         self.analysis.class_methods[node.name] = methods
         self.analysis.class_properties[node.name] = properties
 
+        # Track class-level attributes that reference known functions
+        func_attrs: dict[str, str] = {}
+        for item in node.body:
+            if isinstance(item, ast.Assign):
+                for target in item.targets:
+                    if isinstance(target, ast.Name) and isinstance(item.value, ast.Name):
+                        # Class attr referencing a function: action = wait
+                        ref = item.value.id
+                        if ref in self.analysis.functions:
+                            func_attrs[target.id] = ref
+        if func_attrs:
+            self.analysis.class_func_attrs[node.name] = func_attrs
+
         # Visit the class body for nested items (but don't re-visit methods)
         for item in node.body:
             if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -572,6 +625,38 @@ class CallGraphBuilder(ast.NodeVisitor):
                 self._current_func.calls.append(map_callee_call)
                 self.analysis.call_graph[self._current_func.name].append(func_arg.id)
 
+        # Handle filter(func, items) as higher-order caller
+        if isinstance(node.func, ast.Name) and node.func.id == "filter" and len(node.args) >= 2:
+            func_arg = node.args[0]
+            if isinstance(func_arg, ast.Name):
+                filter_callee_call = CallSite(
+                    name=func_arg.id,
+                    line=node.lineno,
+                    col=node.col_offset,
+                    module=None,
+                    object_type=None,
+                    caller_function=self._current_func.name,
+                    arg_names=None,
+                )
+                self._current_func.calls.append(filter_callee_call)
+                self.analysis.call_graph[self._current_func.name].append(func_arg.id)
+
+        # Handle sorted(items, key=func) as higher-order caller
+        if isinstance(node.func, ast.Name) and node.func.id == "sorted":
+            for kw in node.keywords:
+                if kw.arg == "key" and isinstance(kw.value, ast.Name):
+                    sorted_callee_call = CallSite(
+                        name=kw.value.id,
+                        line=node.lineno,
+                        col=node.col_offset,
+                        module=None,
+                        object_type=None,
+                        caller_function=self._current_func.name,
+                        arg_names=None,
+                    )
+                    self._current_func.calls.append(sorted_callee_call)
+                    self.analysis.call_graph[self._current_func.name].append(kw.value.id)
+
         self.generic_visit(node)
 
     def _resolve_dict_dispatch_call(self, node: ast.Call) -> tuple[str | None, str | None] | None:
@@ -615,40 +700,65 @@ class CallGraphBuilder(ast.NodeVisitor):
             # Track module-level variable types
             for target in node.targets:
                 if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
-                    if isinstance(node.value.func, ast.Name):
-                        self.analysis.module_var_types[target.id] = node.value.func.id
+                    func = node.value.func
+                    if isinstance(func, ast.Name):
+                        self.analysis.module_var_types[target.id] = func.id
+                    elif isinstance(func, ast.Attribute):
+                        # e.g., q = queue.Queue() -> type=Queue
+                        self.analysis.module_var_types[target.id] = func.attr
         self.generic_visit(node)
 
     def visit_With(self, node: ast.With) -> None:
         """Track with-statement context manager calls."""
-        if self._current_func:
-            for item in node.items:
-                if item.context_expr and isinstance(item.context_expr, ast.Call):
-                    # with Timer(): -> Timer() creates object, __enter__ is called
-                    ctx_call = item.context_expr
-                    if isinstance(ctx_call.func, ast.Name):
-                        class_name = ctx_call.func.id
-                        # Record a call to __enter__
-                        enter_key = f"{class_name}.__enter__"
-                        if enter_key in self.analysis.functions:
-                            arg_names: list[str | None] = []
-                            for arg in ctx_call.args:
-                                if isinstance(arg, ast.Name):
-                                    arg_names.append(arg.id)
-                                else:
-                                    arg_names.append(None)
-                            enter_call = CallSite(
-                                name=enter_key,
-                                line=ctx_call.lineno,
-                                col=ctx_call.col_offset,
-                                module=None,
-                                object_type=class_name,
-                                caller_function=self._current_func.name,
-                                arg_names=arg_names,
-                            )
-                            self._current_func.calls.append(enter_call)
-                            self.analysis.call_graph[self._current_func.name].append(enter_key)
+        self._handle_context_manager(node)
         self.generic_visit(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        """Track async with-statement context manager calls."""
+        self._handle_context_manager(node)
+        self.generic_visit(node)
+
+    def _handle_context_manager(self, node: ast.With | ast.AsyncWith) -> None:
+        """Track __enter__ and __aenter__ calls in with statements."""
+        if not self._current_func:
+            return
+
+        for item in node.items:
+            if not item.context_expr or not isinstance(item.context_expr, ast.Call):
+                continue
+
+            ctx_call = item.context_expr
+            if not isinstance(ctx_call.func, ast.Name):
+                continue
+
+            class_name = ctx_call.func.id
+            # Check for __enter__ (sync context manager)
+            enter_key = f"{class_name}.__enter__"
+            if enter_key in self.analysis.functions:
+                self._add_context_manager_call(ctx_call, enter_key, class_name)
+            # Check for __aenter__ (async context manager)
+            aenter_key = f"{class_name}.__aenter__"
+            if aenter_key in self.analysis.functions:
+                self._add_context_manager_call(ctx_call, aenter_key, class_name)
+
+    def _add_context_manager_call(self, ctx_call: ast.Call, key: str, class_name: str) -> None:
+        arg_names: list[str | None] = []
+        for arg in ctx_call.args:
+            if isinstance(arg, ast.Name):
+                arg_names.append(arg.id)
+            else:
+                arg_names.append(None)
+        enter_call = CallSite(
+            name=key,
+            line=ctx_call.lineno,
+            col=ctx_call.col_offset,
+            module=None,
+            object_type=class_name,
+            caller_function=self._current_func.name,
+            arg_names=arg_names,
+        )
+        self._current_func.calls.append(enter_call)
+        self.analysis.call_graph[self._current_func.name].append(key)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         """Track annotated assignments for type inference."""
@@ -809,33 +919,17 @@ class CallGraphBuilder(ast.NodeVisitor):
 def _post_process_decorator_replacements(analysis: ModuleAnalysis, tree: ast.Module) -> None:
     """Detect decorator patterns where a function is replaced by a wrapper.
 
-    Pattern:
-        def slow_decorator(func):
-            def wrapper(*args, **kwargs):
-                time.sleep(2)
-                return func(*args, **kwargs)
-            return wrapper
-
-        @slow_decorator
-        def compute():
-            return 42
-
-    In this case, calling compute() actually calls wrapper().
+    Handles two patterns:
+    1. Simple decorator: @slow_decorator -> compute is replaced by wrapper
+    2. Decorator factory: @retry(3) -> fetch is replaced by innermost wrapper
     """
     for node in ast.iter_child_nodes(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
 
         # Check if this function is a decorator factory (defines and returns a nested func)
-        wrapper_name = None
-        for child in node.body:
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Check if this inner function is returned
-                for stmt in node.body:
-                    if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Name):
-                        if stmt.value.id == child.name:
-                            wrapper_name = child.name
-                            break
+        # Supports both direct return and factory pattern (nested returns)
+        wrapper_name = _find_wrapper_name(node)
 
         if not wrapper_name:
             continue
@@ -856,16 +950,40 @@ def _post_process_decorator_replacements(analysis: ModuleAnalysis, tree: ast.Mod
                     dec_name = dec.func.id
 
                 if dec_name == decorator_name:
-                    # target is decorated with our decorator -> it's replaced by wrapper
-                    analysis.decorator_replacements[target.name] = wrapper_name
+                    _apply_decorator_replacement(analysis, target.name, wrapper_name)
 
-                    # Copy the wrapper's calls to the target function
-                    if wrapper_name in analysis.functions and target.name in analysis.functions:
-                        target_func = analysis.functions[target.name]
-                        wrapper_func = analysis.functions[wrapper_name]
-                        # Add all the wrapper's calls to the decorated function
-                        for call in wrapper_func.calls:
-                            target_func.calls.append(call)
+
+def _find_wrapper_name(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """Find the name of the innermost wrapper function that's returned.
+
+    Handles both simple decorators and decorator factories:
+    - Simple: def dec(f): def wrapper(...): ...; return wrapper
+    - Factory: def dec(n): def decorator(f): def wrapper(...): ...; return wrapper; return decorator
+    """
+    # Look for a returned function name
+    for stmt in func_node.body:
+        if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Name):
+            returned_name = stmt.value.id
+            # Check that this name is a function defined in this body
+            for child in func_node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == returned_name:
+                    # Check if this returned function itself returns another wrapper (factory pattern)
+                    inner_wrapper = _find_wrapper_name(child)
+                    if inner_wrapper:
+                        return inner_wrapper
+                    return returned_name
+    return None
+
+
+def _apply_decorator_replacement(analysis: ModuleAnalysis, target_name: str, wrapper_name: str) -> None:
+    """Apply decorator replacement: copy wrapper's calls to the decorated function."""
+    analysis.decorator_replacements[target_name] = wrapper_name
+
+    if wrapper_name in analysis.functions and target_name in analysis.functions:
+        target_func = analysis.functions[target_name]
+        wrapper_func = analysis.functions[wrapper_name]
+        for call in wrapper_func.calls:
+            target_func.calls.append(call)
 
 
 def analyze_file(filepath: str | Path) -> ModuleAnalysis:
