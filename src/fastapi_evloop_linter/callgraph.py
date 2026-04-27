@@ -307,6 +307,41 @@ class CallGraphBuilder(ast.NodeVisitor):
                             self._current_func.var_module[target.id] = (
                                 self.analysis.import_froms[base].module
                             )
+                        elif base in self._current_func.var_module:
+                            # Propagate from tracked local variable
+                            # e.g., cursor = conn.cursor() where conn has module "sqlite3"
+                            self._current_func.var_module[target.id] = (
+                                self._current_func.var_module[base]
+                            )
+
+            # Handle variable reassignment: propagate type/module from source
+            # e.g., conn = server  ->  copy server's type/module to conn
+            elif isinstance(value, ast.Name):
+                src = value.id
+                if src in self._current_func.var_types:
+                    self._current_func.var_types[target.id] = (
+                        self._current_func.var_types[src]
+                    )
+                if src in self._current_func.var_module:
+                    self._current_func.var_module[target.id] = (
+                        self._current_func.var_module[src]
+                    )
+                if src in self._current_func.var_aliases:
+                    self._current_func.var_aliases[target.id] = (
+                        self._current_func.var_aliases[src]
+                    )
+
+            # Also propagate from module-level vars for reassignment
+            if isinstance(value, ast.Name):
+                src = value.id
+                if src in self.analysis.module_var_types and target.id not in self._current_func.var_types:
+                    self._current_func.var_types[target.id] = (
+                        self.analysis.module_var_types[src]
+                    )
+                if src in self.analysis.module_var_module and target.id not in self._current_func.var_module:
+                    self._current_func.var_module[target.id] = (
+                        self.analysis.module_var_module[src]
+                    )
 
             # Track variable aliasing to blocking functions
             # e.g. f = time.sleep  or  f = requests.get

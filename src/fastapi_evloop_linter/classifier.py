@@ -209,10 +209,21 @@ def classify_call(
                 m = _il.import_module(module)
                 cls = getattr(m, object_type, None)
                 if cls is None:
-                    return (
-                        Verdict.UNKNOWN,
-                        f"{module}.{object_type} unresolved",
-                    )
+                    # For stdlib/builtin modules, the object_type may be a
+                    # method name (e.g. cursor from conn.cursor()) rather
+                    # than an exported class. Trust the module origin and
+                    # fall through to BLOCKING — the call IS on a return
+                    # value of a stdlib function.
+                    if origin in (
+                        ModuleOrigin.STDLIB,
+                        ModuleOrigin.BUILTIN,
+                    ):
+                        pass  # fall through to BLOCKING below
+                    else:
+                        return (
+                            Verdict.UNKNOWN,
+                            f"{module}.{object_type} unresolved",
+                        )
                 if not hasattr(cls, func_name):
                     # The class/factory exists but we can't confirm the
                     # method. For stdlib non-safe modules, factories like
