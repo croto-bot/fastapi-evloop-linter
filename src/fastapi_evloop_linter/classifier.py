@@ -98,6 +98,14 @@ def classify_call(
     if not func_name:
         return Verdict.UNKNOWN, "missing function name"
 
+    # asyncio itself is mostly safe, but these APIs try to drive an event loop
+    # from inside code that may already be running on one.
+    if module and module.split(".")[0] == "asyncio" and func_name in {
+        "run",
+        "run_until_complete",
+    }:
+        return Verdict.BLOCKING, f"asyncio.{func_name} drives the event loop synchronously"
+
     # 1a. getattr(module, <dynamic>) — unknown function on a known module.
     # Flag as warning if the module is not safe (potential blocking call).
     if func_name == "<getattr>" and module:

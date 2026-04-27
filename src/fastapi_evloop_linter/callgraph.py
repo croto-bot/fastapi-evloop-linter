@@ -13,6 +13,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .semantic import (
+    CallOperation,
+    Confidence,
+    ExprResult,
+    FunctionSummary,
+    KnownCallable,
+    KnownInstance,
+    KnownModule,
+    SymbolId,
+    UnknownValue,
+    ValueInfo,
+)
+
 
 @dataclass
 class CallSite:
@@ -25,9 +38,13 @@ class CallSite:
     # The function this call is inside
     caller_function: str | None = None
     # Function names passed as positional arguments (None for non-Name args)
-    arg_names: list[str | None] = field(default_factory=list)
+    arg_names: list[str | None] | None = field(default_factory=list)
     # Whether this is a property access (not a direct call)
     is_property_access: bool = False
+    # Semantic confidence for this resolved operation.
+    confidence: Confidence = Confidence.HIGH
+    # True when the callable is deliberately offloaded from the event loop.
+    offloaded: bool = False
 
 
 @dataclass
@@ -36,6 +53,8 @@ class FuncDef:
     name: str
     is_async: bool
     node: ast.AsyncFunctionDef | ast.FunctionDef
+    # Stable qualified identity. `name` remains the compatibility lookup key.
+    symbol: str | None = None
     calls: list[CallSite] = field(default_factory=list)
     decorators: list[str] = field(default_factory=list)
     # Variables tracked for type inference
@@ -55,6 +74,15 @@ class FuncDef:
     returns_blocking: tuple[str | None, str | None] | None = None
     # Inner functions defined in this function's body (set of names)
     inner_functions: set[str] = field(default_factory=set)
+    # Best-effort return value summary for local function calls.
+    return_type: str | None = None
+    return_module: str | None = None
+    return_alias: tuple[str | None, str | None] | None = None
+    # Function-local bound method aliases: var_name -> qualified method key.
+    bound_methods: dict[str, str] = field(default_factory=dict)
+    # Function-local dict literals that map string keys to callables.
+    blocking_dicts: dict[str, dict[str, tuple[str | None, str | None]]] = field(default_factory=dict)
+    summary: FunctionSummary | None = None
 
 
 @dataclass
@@ -76,6 +104,8 @@ class ModuleAnalysis:
     call_graph: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     # Class definitions: class_name -> set of method names
     class_methods: dict[str, set[str]] = field(default_factory=dict)
+    # Class inheritance: class_name -> [base_class_names]
+    class_bases: dict[str, list[str]] = field(default_factory=dict)
     # Dunder method to class mapping: method_name (e.g. "__call__") -> {class_name: func_def_name}
     dunder_map: dict[str, dict[str, str]] = field(default_factory=dict)
     # Decorator replacements: original_func_name -> wrapper_func_name
@@ -91,6 +121,8 @@ class ModuleAnalysis:
     module_var_module: dict[str, str] = field(default_factory=dict)
     # Class attributes that reference known functions: class_name -> {attr_name: func_name}
     class_func_attrs: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Class attributes that reference imported callables: class_name -> {attr_name -> (module, func_name)}
+    class_callable_attrs: dict[str, dict[str, tuple[str | None, str | None]]] = field(default_factory=dict)
     # Instance attribute source modules: class_name -> {attr_name -> module}
     # e.g. self.conn = sqlite3.connect(...) -> {"UserRepository": {"conn": "sqlite3"}}
     class_attr_modules: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -100,6 +132,12 @@ class ModuleAnalysis:
     # Module-level variable aliases: var_name -> (module, func_name)
     # e.g. query_runner = create_query_runner(...) -> {"query_runner": (None, "run_query")}
     module_var_aliases: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
+    # Stable symbol lookup for local functions/methods.
+    symbols: dict[str, FuncDef] = field(default_factory=dict)
+    # Backwards-compatible aliases from short names to qualified symbols.
+    symbol_aliases: dict[str, str] = field(default_factory=dict)
+    # Module-level bound method aliases: var_name -> qualified method key.
+    module_bound_methods: dict[str, str] = field(default_factory=dict)
 
 
 class CallGraphBuilder(ast.NodeVisitor):
@@ -111,6 +149,99 @@ class CallGraphBuilder(ast.NodeVisitor):
         self._current_func: FuncDef | None = None
         self._current_class: str | None = None
         self._scope_stack: list[FuncDef] = []
+
+    def _symbol_for(
+        self,
+        name: str,
+        class_name: str | None = None,
+        parent: FuncDef | None = None,
+    ) -> str:
+        """Return the stable local symbol for a definition."""
+        if class_name:
+            return SymbolId.class_member(class_name, name).name
+        if parent:
+            parent_symbol = parent.symbol or parent.name
+            return SymbolId.nested(parent_symbol, name).name
+        return SymbolId.module_function(name).name
+
+    def _register_function(self, func: FuncDef, compatibility_name: str | None = None) -> None:
+        """Register a function by stable symbol and compatibility aliases."""
+        symbol = func.symbol or func.name
+        func.symbol = symbol
+        self.analysis.functions[symbol] = func
+        self.analysis.symbols[symbol] = func
+        if compatibility_name:
+            self.analysis.symbol_aliases.setdefault(compatibility_name, symbol)
+            self.analysis.functions.setdefault(compatibility_name, func)
+
+    def _lookup_function(self, name: str | None) -> FuncDef | None:
+        if not name:
+            return None
+        func = self.analysis.functions.get(name)
+        if func is not None:
+            return func
+        alias = self.analysis.symbol_aliases.get(name)
+        if alias:
+            return self.analysis.functions.get(alias)
+        return None
+
+    def _local_method_key(self, class_name: str | None, method_name: str) -> str | None:
+        if not class_name:
+            return None
+        key = SymbolId.class_member(class_name, method_name).name
+        if key in self.analysis.functions:
+            return key
+        return None
+
+    def precollect_definitions(self, tree: ast.Module) -> None:
+        """Collect local symbol identities before analyzing executable bodies."""
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbol = self._symbol_for(node.name)
+                func = FuncDef(
+                    name=node.name,
+                    is_async=isinstance(node, ast.AsyncFunctionDef),
+                    node=node,
+                    symbol=symbol,
+                    decorators=[self._get_decorator_name(d) for d in node.decorator_list],
+                    params=self._extract_params(node),
+                )
+                self._register_function(func, compatibility_name=node.name)
+            elif isinstance(node, ast.ClassDef):
+                self._precollect_class(node)
+
+    def _precollect_class(self, node: ast.ClassDef) -> None:
+        methods: set[str] = set()
+        properties: set[str] = set()
+        self.analysis.class_bases[node.name] = [
+            base.id for base in node.bases if isinstance(base, ast.Name)
+        ]
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            is_prop = any(
+                self._get_decorator_name(d) == "property"
+                for d in item.decorator_list
+            )
+            if is_prop:
+                properties.add(item.name)
+                symbol = SymbolId.class_member(node.name, f"<prop:{item.name}>").name
+            else:
+                methods.add(item.name)
+                symbol = SymbolId.class_member(node.name, item.name).name
+                if item.name.startswith("__") and item.name.endswith("__"):
+                    self.analysis.dunder_map.setdefault(item.name, {})[node.name] = symbol
+            func = FuncDef(
+                name=symbol,
+                is_async=isinstance(item, ast.AsyncFunctionDef),
+                node=item,
+                symbol=symbol,
+                decorators=[self._get_decorator_name(d) for d in item.decorator_list],
+                params=self._extract_params(item),
+            )
+            self._register_function(func)
+        self.analysis.class_methods[node.name] = methods
+        self.analysis.class_properties[node.name] = properties
 
     def _get_decorator_name(self, node: ast.expr) -> str:
         """Extract decorator name from AST node."""
@@ -153,6 +284,8 @@ class CallGraphBuilder(ast.NodeVisitor):
         if isinstance(func, ast.Name):
             # Simple function call: foo()
             name = func.id
+            if self._lookup_function(name):
+                return None, name, None
             # Check if it's an imported name
             if name in self.analysis.imports:
                 imp = self.analysis.imports[name]
@@ -165,6 +298,9 @@ class CallGraphBuilder(ast.NodeVisitor):
             if self._current_func and name in self._current_func.var_aliases:
                 alias_mod, alias_name = self._current_func.var_aliases[name]
                 return alias_mod, alias_name, None
+            if self._current_func and name in self._current_func.bound_methods:
+                method_key = self._current_func.bound_methods[name]
+                return None, method_key, method_key.rsplit(".", 1)[0]
             # Check if this is a callable object (has __call__)
             if self._current_func and name in self._current_func.var_types:
                 var_type = self._current_func.var_types[name]
@@ -182,6 +318,9 @@ class CallGraphBuilder(ast.NodeVisitor):
             if name in self.analysis.module_var_aliases:
                 alias_mod, alias_name = self.analysis.module_var_aliases[name]
                 return alias_mod, alias_name, None
+            if name in self.analysis.module_bound_methods:
+                method_key = self.analysis.module_bound_methods[name]
+                return None, method_key, method_key.rsplit(".", 1)[0]
             # Bare-name fallback: search imported modules via runtime introspection
             # for an exported callable matching this name. e.g. `import time` then
             # bare `sleep(5)` (semantically wrong but legal-looking) — we infer
@@ -199,6 +338,10 @@ class CallGraphBuilder(ast.NodeVisitor):
 
             if isinstance(value, ast.Name):
                 base_name = value.id
+                if base_name in {"self", "cls"} and self._current_class:
+                    local_method = self._local_method_key(self._current_class, attr_name)
+                    if local_method:
+                        return None, local_method, self._current_class
                 # Check if base is an imported module
                 if base_name in self.analysis.imports:
                     imp = self.analysis.imports[base_name]
@@ -210,21 +353,35 @@ class CallGraphBuilder(ast.NodeVisitor):
                 # Check if we know the type of this variable
                 if self._current_func and base_name in self._current_func.var_types:
                     obj_type = self._current_func.var_types[base_name]
+                    local_method = self._local_method_key(obj_type, attr_name)
+                    if local_method:
+                        return None, local_method, obj_type
                     # Check if this is a class function attribute
                     if obj_type in self.analysis.class_func_attrs:
                         if attr_name in self.analysis.class_func_attrs[obj_type]:
                             real_func = self.analysis.class_func_attrs[obj_type][attr_name]
                             return None, real_func, None
+                    if obj_type in self.analysis.class_callable_attrs:
+                        if attr_name in self.analysis.class_callable_attrs[obj_type]:
+                            alias_mod, alias_name = self.analysis.class_callable_attrs[obj_type][attr_name]
+                            return alias_mod, alias_name, None
                     # Propagate source module if tracked (e.g. smtplib.SMTP() -> "smtplib")
                     src_mod = self._current_func.var_module.get(base_name)
                     return src_mod, attr_name, obj_type
                 # Check module-level var types
                 if base_name in self.analysis.module_var_types:
                     obj_type = self.analysis.module_var_types[base_name]
+                    local_method = self._local_method_key(obj_type, attr_name)
+                    if local_method:
+                        return None, local_method, obj_type
                     if obj_type in self.analysis.class_func_attrs:
                         if attr_name in self.analysis.class_func_attrs[obj_type]:
                             real_func = self.analysis.class_func_attrs[obj_type][attr_name]
                             return None, real_func, None
+                    if obj_type in self.analysis.class_callable_attrs:
+                        if attr_name in self.analysis.class_callable_attrs[obj_type]:
+                            alias_mod, alias_name = self.analysis.class_callable_attrs[obj_type][attr_name]
+                            return alias_mod, alias_name, None
                     # If we know the source module of this var (from
                     # `q = queue.Queue()` or `from queue import Queue`), propagate
                     # it so the classifier can verify the method on that class.
@@ -302,6 +459,15 @@ class CallGraphBuilder(ast.NodeVisitor):
                 return None, attr_name, None
 
             elif isinstance(value, ast.Call):
+                if (
+                    isinstance(value.func, ast.Name)
+                    and value.func.id == "super"
+                    and self._current_class
+                ):
+                    for base_class in self.analysis.class_bases.get(self._current_class, []):
+                        method_key = self._local_method_key(base_class, attr_name)
+                        if method_key:
+                            return None, method_key, base_class
                 # Chained: SomeClass().method() or module.Func().method()
                 # Try to resolve the call target
                 inner = self._resolve_call_name(value)
@@ -328,6 +494,8 @@ class CallGraphBuilder(ast.NodeVisitor):
             return
 
         if isinstance(target, ast.Name):
+            self._apply_value_to_name(target.id, self._infer_expr_value(value))
+
             # Track: var = SomeClass()
             if isinstance(value, ast.Call):
                 func = value.func
@@ -350,9 +518,13 @@ class CallGraphBuilder(ast.NodeVisitor):
                         self._current_func.var_types[target.id] = name
 
                     # Check if the called function returns a blocking reference
-                    callee = self.analysis.functions.get(name)
+                    callee = self._lookup_function(name)
                     if callee and callee.returns_blocking:
                         self._current_func.var_aliases[target.id] = callee.returns_blocking
+                    if callee and callee.return_type:
+                        self._current_func.var_types[target.id] = callee.return_type
+                        if callee.return_module:
+                            self._current_func.var_module[target.id] = callee.return_module
 
                 elif isinstance(func, ast.Attribute):
                     self._current_func.var_types[target.id] = func.attr
@@ -376,9 +548,13 @@ class CallGraphBuilder(ast.NodeVisitor):
                                 self._current_func.var_module[base]
                             )
                     # Check if the method returns a blocking reference (closure/factory)
-                    callee = self.analysis.functions.get(func.attr)
+                    callee = self._lookup_function(func.attr)
                     if callee and callee.returns_blocking:
                         self._current_func.var_aliases[target.id] = callee.returns_blocking
+                    if callee and callee.return_type:
+                        self._current_func.var_types[target.id] = callee.return_type
+                        if callee.return_module:
+                            self._current_func.var_module[target.id] = callee.return_module
 
             # Handle variable reassignment: propagate type/module from source
             # e.g., conn = server  ->  copy server's type/module to conn
@@ -434,6 +610,99 @@ class CallGraphBuilder(ast.NodeVisitor):
                         self.analysis.class_attr_modules.setdefault(class_name, {})[attr_name] = module
                     if func_name:
                         self.analysis.class_attr_types.setdefault(class_name, {})[attr_name] = func_name
+
+    def _infer_expr_value(self, value: ast.expr) -> ValueInfo:
+        """Infer a reusable semantic value from an expression."""
+        if isinstance(value, ast.Await):
+            return self._infer_expr_value(value.value)
+
+        if isinstance(value, ast.Name):
+            name = value.id
+            if self._current_func:
+                if name in self._current_func.bound_methods:
+                    symbol = self._current_func.bound_methods[name]
+                    return KnownCallable(symbol=symbol, name=symbol)
+                if name in self._current_func.var_aliases:
+                    module, func_name = self._current_func.var_aliases[name]
+                    return KnownCallable(module=module, name=func_name)
+                if name in self._current_func.var_types:
+                    return KnownInstance(
+                        module=self._current_func.var_module.get(name),
+                        type_name=self._current_func.var_types[name],
+                    )
+            if name in self.analysis.module_bound_methods:
+                symbol = self.analysis.module_bound_methods[name]
+                return KnownCallable(symbol=symbol, name=symbol)
+            if name in self.analysis.module_var_aliases:
+                module, func_name = self.analysis.module_var_aliases[name]
+                return KnownCallable(module=module, name=func_name)
+            if name in self.analysis.module_var_types:
+                return KnownInstance(
+                    module=self.analysis.module_var_module.get(name),
+                    type_name=self.analysis.module_var_types[name],
+                )
+            if name in self.analysis.imports:
+                return KnownModule(module=self.analysis.imports[name].module)
+            if name in self.analysis.import_froms:
+                imp = self.analysis.import_froms[name]
+                return KnownCallable(module=imp.module, name=imp.name)
+            return UnknownValue(reason=f"unresolved name {name}")
+
+        if isinstance(value, ast.Attribute):
+            method = self._resolve_bound_method(value)
+            if method:
+                return KnownCallable(symbol=method, name=method)
+            ref = self._resolve_blocking_ref(value)
+            if ref:
+                return KnownCallable(module=ref[0], name=ref[1])
+            return UnknownValue(reason="unresolved attribute")
+
+        if isinstance(value, ast.Call):
+            module, func_name, obj_type = self._resolve_call_name(value)
+            if module and func_name:
+                return KnownInstance(module=module, type_name=func_name)
+            if module and obj_type:
+                return KnownInstance(module=module, type_name=obj_type)
+            callee = self._lookup_function(func_name)
+            if callee:
+                if callee.return_alias:
+                    return KnownCallable(module=callee.return_alias[0], name=callee.return_alias[1])
+                if callee.return_type:
+                    return KnownInstance(module=callee.return_module, type_name=callee.return_type)
+            if func_name and obj_type:
+                return KnownInstance(module=module, type_name=obj_type)
+            if func_name:
+                return KnownInstance(module=module, type_name=func_name)
+
+        return UnknownValue()
+
+    def _apply_value_to_name(self, name: str, value: ValueInfo) -> None:
+        """Bind a semantic value to a local name."""
+        if not self._current_func:
+            return
+        if isinstance(value, KnownInstance) and value.type_name:
+            self._current_func.var_types[name] = value.type_name
+            if value.module:
+                self._current_func.var_module[name] = value.module
+        elif isinstance(value, KnownCallable):
+            if value.symbol:
+                self._current_func.bound_methods[name] = value.symbol
+            elif value.module or value.name:
+                self._current_func.var_aliases[name] = (value.module, value.name)
+
+    def _resolve_bound_method(self, value: ast.Attribute) -> str | None:
+        """Resolve `obj.method` to a qualified local method symbol when possible."""
+        if not isinstance(value.value, ast.Name):
+            return None
+        base = value.value.id
+        class_name = None
+        if self._current_func and base in self._current_func.var_types:
+            class_name = self._current_func.var_types[base]
+        elif base in self.analysis.module_var_types:
+            class_name = self.analysis.module_var_types[base]
+        if not class_name:
+            return None
+        return self._local_method_key(class_name, value.attr)
 
     def _resolve_getattr_call(self, node: ast.Call) -> tuple[str | None, str | None] | None:
         """Resolve getattr(module_or_var, 'name') to (module, func_name).
@@ -660,10 +929,14 @@ class CallGraphBuilder(ast.NodeVisitor):
             self.visit(stmt)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        parent = self._current_func
+        class_name = self._current_class
+        symbol = self._symbol_for(node.name, class_name=class_name, parent=parent if not class_name else None)
         func = FuncDef(
             name=node.name,
             is_async=True,
             node=node,
+            symbol=symbol,
             decorators=[self._get_decorator_name(d) for d in node.decorator_list],
             params=self._extract_params(node),
         )
@@ -679,17 +952,24 @@ class CallGraphBuilder(ast.NodeVisitor):
         self._scope_stack.pop()
         self._current_func = prev
 
-        self.analysis.functions[node.name] = func
+        self._register_function(
+            func,
+            compatibility_name=node.name if not class_name and not parent else None,
+        )
 
         if is_endpoint:
             func.decorators.append("__fastapi_endpoint__")
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Visit sync function definitions (helpers called from async)."""
+        parent = self._current_func
+        class_name = self._current_class
+        symbol = self._symbol_for(node.name, class_name=class_name, parent=parent if not class_name else None)
         func = FuncDef(
             name=node.name,
             is_async=False,
             node=node,
+            symbol=symbol,
             decorators=[self._get_decorator_name(d) for d in node.decorator_list],
             params=self._extract_params(node),
         )
@@ -704,17 +984,23 @@ class CallGraphBuilder(ast.NodeVisitor):
         self._current_func = prev
 
         # Store function - but check if a decorator wrapper already took this name
-        self.analysis.functions[node.name] = func
+        self._register_function(
+            func,
+            compatibility_name=node.name if not class_name and not parent else None,
+        )
 
         # Register this function as an inner function of its parent scope
         if self._current_func:
-            self._current_func.inner_functions.add(node.name)
+            self._current_func.inner_functions.add(symbol)
             self._current_func.is_decorator_wrapper = True
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Track class definitions and their methods."""
         prev_class = self._current_class
         self._current_class = node.name
+        self.analysis.class_bases[node.name] = [
+            base.id for base in node.bases if isinstance(base, ast.Name)
+        ]
 
         methods = set()
         properties = set()
@@ -728,11 +1014,12 @@ class CallGraphBuilder(ast.NodeVisitor):
                 if is_prop:
                     properties.add(item.name)
                     # Add property getter as a synthetic function for tracing
-                    prop_key = f"{node.name}.<prop:{item.name}>"
+                    prop_key = SymbolId.class_member(node.name, f"<prop:{item.name}>").name
                     prop_func = FuncDef(
                         name=prop_key,
                         is_async=isinstance(item, ast.AsyncFunctionDef),
                         node=item,
+                        symbol=prop_key,
                         decorators=[self._get_decorator_name(d) for d in item.decorator_list],
                         params=self._extract_params(item),
                     )
@@ -742,7 +1029,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                     self._visit_function_body(item)
                     self._scope_stack.pop()
                     self._current_func = prev
-                    self.analysis.functions[prop_key] = prop_func
+                    self._register_function(prop_func)
                 else:
                     methods.add(item.name)
                     # Map dunder methods: e.g. __call__ -> {ClassName: __call___ClassName}
@@ -750,7 +1037,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                         if item.name not in self.analysis.dunder_map:
                             self.analysis.dunder_map[item.name] = {}
                         # Use a synthetic name to avoid collisions
-                        dunder_key = f"{node.name}.{item.name}"
+                        dunder_key = SymbolId.class_member(node.name, item.name).name
                         self.analysis.dunder_map[item.name][node.name] = dunder_key
 
                         # Also add the dunder method as a regular function so the checker can trace into it
@@ -758,6 +1045,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                             name=dunder_key,
                             is_async=isinstance(item, ast.AsyncFunctionDef),
                             node=item,
+                            symbol=dunder_key,
                             decorators=[self._get_decorator_name(d) for d in item.decorator_list],
                             params=self._extract_params(item),
                         )
@@ -769,14 +1057,16 @@ class CallGraphBuilder(ast.NodeVisitor):
                         self._scope_stack.pop()
                         self._current_func = prev
 
-                        self.analysis.functions[dunder_key] = dunder_func
+                        self._register_function(dunder_func)
                     else:
                         # Non-dunder, non-property methods - still visit their bodies
                         prev = self._current_func
+                        method_key = SymbolId.class_member(node.name, item.name).name
                         method_func = FuncDef(
-                            name=item.name,
+                            name=method_key,
                             is_async=isinstance(item, ast.AsyncFunctionDef),
                             node=item,
+                            symbol=method_key,
                             decorators=[self._get_decorator_name(d) for d in item.decorator_list],
                             params=self._extract_params(item),
                         )
@@ -785,13 +1075,14 @@ class CallGraphBuilder(ast.NodeVisitor):
                         self._visit_function_body(item)
                         self._scope_stack.pop()
                         self._current_func = prev
-                        self.analysis.functions[item.name] = method_func
+                        self._register_function(method_func)
 
         self.analysis.class_methods[node.name] = methods
         self.analysis.class_properties[node.name] = properties
 
         # Track class-level attributes that reference known functions
         func_attrs: dict[str, str] = {}
+        callable_attrs: dict[str, tuple[str | None, str | None]] = {}
         for item in node.body:
             if isinstance(item, ast.Assign):
                 for target in item.targets:
@@ -800,8 +1091,22 @@ class CallGraphBuilder(ast.NodeVisitor):
                         ref = item.value.id
                         if ref in self.analysis.functions:
                             func_attrs[target.id] = ref
+                        elif ref in self.analysis.import_froms:
+                            imp = self.analysis.import_froms[ref]
+                            callable_attrs[target.id] = (imp.module, imp.name)
+                    elif isinstance(target, ast.Name) and isinstance(item.value, ast.Call):
+                        if isinstance(item.value.func, ast.Name):
+                            self.analysis.class_attr_types.setdefault(node.name, {})[
+                                target.id
+                            ] = item.value.func.id
+                    elif isinstance(target, ast.Name) and isinstance(item.value, ast.Attribute):
+                        resolved = self._resolve_blocking_ref(item.value)
+                        if resolved:
+                            callable_attrs[target.id] = resolved
         if func_attrs:
             self.analysis.class_func_attrs[node.name] = func_attrs
+        if callable_attrs:
+            self.analysis.class_callable_attrs[node.name] = callable_attrs
 
         # Visit the class body for nested items (but don't re-visit methods)
         for item in node.body:
@@ -841,6 +1146,8 @@ class CallGraphBuilder(ast.NodeVisitor):
         for arg in node.args:
             if isinstance(arg, ast.Name):
                 arg_names.append(arg.id)
+            elif isinstance(arg, ast.Attribute):
+                arg_names.append(self._resolve_bound_method(arg))
             else:
                 arg_names.append(None)
         call_site = CallSite(
@@ -898,9 +1205,27 @@ class CallGraphBuilder(ast.NodeVisitor):
         # - For imported names: always add (they are never reached via arg_names).
         caller_is_local = (
             isinstance(node.func, ast.Name)
-            and node.func.id in self.analysis.functions
+            and self._lookup_function(node.func.id) is not None
         )
-        for hof_arg in node.args:
+        offloaded_positions = self._offloaded_callback_positions(node, module, func_name)
+        for index, hof_arg in enumerate(node.args):
+            if index in offloaded_positions:
+                continue
+            if isinstance(hof_arg, ast.Attribute):
+                bound_method = self._resolve_bound_method(hof_arg)
+                if bound_method and not caller_is_local:
+                    hof_call = CallSite(
+                        name=bound_method,
+                        line=node.lineno,
+                        col=node.col_offset,
+                        module=None,
+                        object_type=bound_method.rsplit(".", 1)[0],
+                        caller_function=self._current_func.name,
+                        arg_names=None,
+                    )
+                    self._current_func.calls.append(hof_call)
+                    self.analysis.call_graph[self._current_func.name].append(bound_method)
+                continue
             if not isinstance(hof_arg, ast.Name):
                 continue
             hof_name = hof_arg.id
@@ -917,7 +1242,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                 )
                 self._current_func.calls.append(hof_call)
                 self.analysis.call_graph[self._current_func.name].append(imp.name)
-            elif hof_name in self.analysis.functions and not caller_is_local:
+            elif self._lookup_function(hof_name) is not None and not caller_is_local:
                 # Local function passed to a non-local caller (e.g. map, list, etc.)
                 hof_call = CallSite(
                     name=hof_name,
@@ -935,6 +1260,24 @@ class CallGraphBuilder(ast.NodeVisitor):
         # min(items, key=fn), max(items, key=fn) etc., where the callable is
         # passed as a keyword. Same shape as the positional case above.
         for kw in node.keywords:
+            if kw.arg in {"func"} and 0 in offloaded_positions:
+                continue
+            if isinstance(kw.value, ast.Attribute):
+                bound_method = self._resolve_bound_method(kw.value)
+                if bound_method and not caller_is_local:
+                    self._current_func.calls.append(
+                        CallSite(
+                            name=bound_method,
+                            line=node.lineno,
+                            col=node.col_offset,
+                            module=None,
+                            object_type=bound_method.rsplit(".", 1)[0],
+                            caller_function=self._current_func.name,
+                            arg_names=None,
+                        )
+                    )
+                    self.analysis.call_graph[self._current_func.name].append(bound_method)
+                continue
             if not isinstance(kw.value, ast.Name):
                 continue
             kw_name = kw.value.id
@@ -952,7 +1295,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                     )
                 )
                 self.analysis.call_graph[self._current_func.name].append(imp.name)
-            elif kw_name in self.analysis.functions and not caller_is_local:
+            elif self._lookup_function(kw_name) is not None and not caller_is_local:
                 self._current_func.calls.append(
                     CallSite(
                         name=kw_name,
@@ -968,34 +1311,58 @@ class CallGraphBuilder(ast.NodeVisitor):
 
         self.generic_visit(node)
 
+    def _offloaded_callback_positions(
+        self,
+        node: ast.Call,
+        module: str | None,
+        func_name: str | None,
+    ) -> set[int]:
+        """Return callback argument indexes that run off the event loop."""
+        if module == "asyncio" and func_name == "to_thread":
+            return {0}
+        if func_name == "run_in_executor":
+            return {1}
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "submit":
+            # concurrent.futures executors run callbacks in worker threads/processes.
+            return {0}
+        return set()
+
     def _resolve_dict_dispatch_call(self, node: ast.Call) -> tuple[str | None, str | None] | None:
         """Resolve dict dispatch calls like HANDLERS[\"wait\"](5)."""
-        # The func of the Call should be a Subscript
-        if not isinstance(node.func, ast.Subscript):
-            return None
-
-        subscript = node.func
-        # The value should be a Name referencing a known blocking dict
-        if not isinstance(subscript.value, ast.Name):
-            return None
-
-        dict_name = subscript.value.id
-        if dict_name not in self.analysis.blocking_dicts:
-            return None
-
-        # Get the key
+        dict_name: str | None = None
         key = None
-        if isinstance(subscript.slice, ast.Constant):
-            key = subscript.slice.value
 
-        if key and isinstance(key, str) and key in self.analysis.blocking_dicts[dict_name]:
-            return self.analysis.blocking_dicts[dict_name][key]
+        # HANDLERS["wait"]()
+        if isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Name):
+            dict_name = node.func.value.id
+            if isinstance(node.func.slice, ast.Constant):
+                key = node.func.slice.value
 
-        # If we can't resolve the exact key, report the first value as a heuristic
-        # (covers cases where the key is a variable)
-        if self.analysis.blocking_dicts[dict_name]:
-            first_val = next(iter(self.analysis.blocking_dicts[dict_name].values()))
-            return first_val
+        # HANDLERS.get("wait")()
+        elif (
+            isinstance(node.func, ast.Call)
+            and isinstance(node.func.func, ast.Attribute)
+            and node.func.func.attr == "get"
+            and isinstance(node.func.func.value, ast.Name)
+        ):
+            dict_name = node.func.func.value.id
+            if node.func.args and isinstance(node.func.args[0], ast.Constant):
+                key = node.func.args[0].value
+
+        if not dict_name:
+            return None
+
+        dicts: list[dict[str, tuple[str | None, str | None]]] = []
+        if self._current_func and dict_name in self._current_func.blocking_dicts:
+            dicts.append(self._current_func.blocking_dicts[dict_name])
+        if dict_name in self.analysis.blocking_dicts:
+            dicts.append(self.analysis.blocking_dicts[dict_name])
+
+        for key_map in dicts:
+            if key and isinstance(key, str) and key in key_map:
+                return key_map[key]
+            if key_map:
+                return next(iter(key_map.values()))
 
         return None
 
@@ -1003,11 +1370,25 @@ class CallGraphBuilder(ast.NodeVisitor):
         """Track variable assignments for type inference and aliasing."""
         for target in node.targets:
             self._track_assignment_type(target, node.value)
+        self._track_blocking_dict(node)
         # Track module-level assignments
         if self._current_func is None:
-            self._track_blocking_dict(node)
             # Track module-level variable types
             for target in node.targets:
+                if isinstance(target, ast.Name):
+                    inferred = self._infer_expr_value(node.value)
+                    if isinstance(inferred, KnownInstance) and inferred.type_name:
+                        self.analysis.module_var_types[target.id] = inferred.type_name
+                        if inferred.module:
+                            self.analysis.module_var_module[target.id] = inferred.module
+                    elif isinstance(inferred, KnownCallable):
+                        if inferred.symbol:
+                            self.analysis.module_bound_methods[target.id] = inferred.symbol
+                        elif inferred.module or inferred.name:
+                            self.analysis.module_var_aliases[target.id] = (
+                                inferred.module,
+                                inferred.name,
+                            )
                 if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
                     func = node.value.func
                     if isinstance(func, ast.Name):
@@ -1020,9 +1401,13 @@ class CallGraphBuilder(ast.NodeVisitor):
                             )
                         # Check if the called function returns a blocking reference
                         # (closure/factory pattern at module level)
-                        callee = self.analysis.functions.get(func.id)
+                        callee = self._lookup_function(func.id)
                         if callee and callee.returns_blocking:
                             self.analysis.module_var_aliases[target.id] = callee.returns_blocking
+                        if callee and callee.return_type:
+                            self.analysis.module_var_types[target.id] = callee.return_type
+                            if callee.return_module:
+                                self.analysis.module_var_module[target.id] = callee.return_module
                     elif isinstance(func, ast.Attribute):
                         # e.g., q = queue.Queue() -> type=Queue, source module=queue
                         self.analysis.module_var_types[target.id] = func.attr
@@ -1033,9 +1418,13 @@ class CallGraphBuilder(ast.NodeVisitor):
                                     self.analysis.imports[base].module
                                 )
                         # Check if the method returns a blocking reference
-                        callee = self.analysis.functions.get(func.attr)
+                        callee = self._lookup_function(func.attr)
                         if callee and callee.returns_blocking:
                             self.analysis.module_var_aliases[target.id] = callee.returns_blocking
+                        if callee and callee.return_type:
+                            self.analysis.module_var_types[target.id] = callee.return_type
+                            if callee.return_module:
+                                self.analysis.module_var_module[target.id] = callee.return_module
         self.generic_visit(node)
 
     def visit_With(self, node: ast.With) -> None:
@@ -1063,6 +1452,9 @@ class CallGraphBuilder(ast.NodeVisitor):
 
                 if isinstance(ctx_expr.func, ast.Name):
                     class_name = ctx_expr.func.id
+                    if class_name == "open":
+                        class_name = "TextIOWrapper"
+                        source_module = "io"
                 elif isinstance(ctx_expr.func, ast.Attribute):
                     class_name = ctx_expr.func.attr
                     # Resolve source module from module.Class pattern
@@ -1077,13 +1469,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                     # Track the as-variable type and source module
                     self._track_with_var(item, class_name, source_module)
 
-                    # Check for __enter__ / __aenter__ in locally-defined classes
-                    enter_key = f"{class_name}.__enter__"
-                    if enter_key in self.analysis.functions:
-                        self._add_context_manager_call(ctx_expr, enter_key, class_name)
-                    aenter_key = f"{class_name}.__aenter__"
-                    if aenter_key in self.analysis.functions:
-                        self._add_context_manager_call(ctx_expr, aenter_key, class_name)
+                    self._add_context_manager_dunders(ctx_expr, class_name, is_async=isinstance(node, ast.AsyncWith))
 
             # --- Case B: context expression is a plain variable (with zf as archive:) ---
             elif isinstance(ctx_expr, ast.Name):
@@ -1099,6 +1485,7 @@ class CallGraphBuilder(ast.NodeVisitor):
                     source_module = self.analysis.module_var_module.get(var_name)
                 if class_name:
                     self._track_with_var(item, class_name, source_module)
+                    self._add_context_manager_dunders(ctx_expr, class_name, is_async=isinstance(node, ast.AsyncWith))
 
     def _track_with_var(
         self,
@@ -1116,16 +1503,37 @@ class CallGraphBuilder(ast.NodeVisitor):
                 self._current_func.var_module[var_name] = source_module
 
     def _add_context_manager_call(self, ctx_call: ast.Call, key: str, class_name: str) -> None:
+        self._add_context_manager_call_from_expr(ctx_call, key, class_name)
+
+    def _add_context_manager_dunders(
+        self,
+        ctx_expr: ast.expr,
+        class_name: str,
+        is_async: bool,
+    ) -> None:
+        names = ("__aenter__", "__aexit__") if is_async else ("__enter__", "__exit__")
+        for dunder_name in names:
+            key = f"{class_name}.{dunder_name}"
+            if key in self.analysis.functions:
+                self._add_context_manager_call_from_expr(ctx_expr, key, class_name)
+
+    def _add_context_manager_call_from_expr(
+        self,
+        ctx_expr: ast.expr,
+        key: str,
+        class_name: str,
+    ) -> None:
         arg_names: list[str | None] = []
-        for arg in ctx_call.args:
-            if isinstance(arg, ast.Name):
-                arg_names.append(arg.id)
-            else:
-                arg_names.append(None)
+        if isinstance(ctx_expr, ast.Call):
+            for arg in ctx_expr.args:
+                if isinstance(arg, ast.Name):
+                    arg_names.append(arg.id)
+                else:
+                    arg_names.append(None)
         enter_call = CallSite(
             name=key,
-            line=ctx_call.lineno,
-            col=ctx_call.col_offset,
+            line=ctx_expr.lineno,
+            col=ctx_expr.col_offset,
             module=None,
             object_type=class_name,
             caller_function=self._current_func.name,
@@ -1143,27 +1551,61 @@ class CallGraphBuilder(ast.NodeVisitor):
     def visit_Return(self, node: ast.Return) -> None:
         """Track return statements for blocking function references."""
         if node.value and self._current_func:
+            inferred = self._infer_expr_value(node.value)
+            if isinstance(inferred, KnownInstance):
+                self._current_func.return_type = inferred.type_name
+                self._current_func.return_module = inferred.module
+            elif isinstance(inferred, KnownCallable):
+                if inferred.symbol:
+                    self._current_func.return_alias = (None, inferred.symbol)
+                else:
+                    self._current_func.return_alias = (inferred.module, inferred.name)
+
             resolved = self._resolve_blocking_ref(node.value)
             if resolved:
                 self._current_func.returns_blocking = resolved
-            elif isinstance(node.value, ast.Name) and node.value.id in self._current_func.inner_functions:
+                self._current_func.return_alias = resolved
+            elif isinstance(node.value, ast.Name) and (
+                node.value.id in self._current_func.inner_functions
+                or any(sym.endswith(f".<locals>.{node.value.id}") for sym in self._current_func.inner_functions)
+            ):
                 # Returning a locally-defined inner function (closure/factory pattern)
-                self._current_func.returns_blocking = (None, node.value.id)
+                inner_symbol = next(
+                    (
+                        sym
+                        for sym in self._current_func.inner_functions
+                        if sym.endswith(f".<locals>.{node.value.id}")
+                    ),
+                    node.value.id,
+                )
+                self._current_func.returns_blocking = (None, inner_symbol)
+                self._current_func.return_alias = (None, inner_symbol)
             elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
                 # Returning a call to a locally-defined inner function:
                 #   return inner_func(args)
                 # The inner function may itself return a closure.
                 callee_name = node.value.func.id
-                if callee_name in self._current_func.inner_functions:
-                    callee = self.analysis.functions.get(callee_name)
+                inner_symbol = next(
+                    (
+                        sym
+                        for sym in self._current_func.inner_functions
+                        if sym == callee_name or sym.endswith(f".<locals>.{callee_name}")
+                    ),
+                    None,
+                )
+                if inner_symbol:
+                    callee = self._lookup_function(inner_symbol)
                     if callee and callee.returns_blocking:
                         self._current_func.returns_blocking = callee.returns_blocking
                 # Also handle returning a call to a regular local function
                 # that has returns_blocking set (covers indirect factory chains)
-                elif callee_name in self.analysis.functions:
-                    callee = self.analysis.functions[callee_name]
-                    if callee.returns_blocking:
+                else:
+                    callee = self._lookup_function(callee_name)
+                    if callee and callee.returns_blocking:
                         self._current_func.returns_blocking = callee.returns_blocking
+                    if callee and callee.return_type:
+                        self._current_func.return_type = callee.return_type
+                        self._current_func.return_module = callee.return_module
         self.generic_visit(node)
 
     def _track_blocking_dict(self, node: ast.Assign) -> None:
@@ -1188,7 +1630,10 @@ class CallGraphBuilder(ast.NodeVisitor):
                     key_map[key.value] = resolved
 
             if key_map:
-                self.analysis.blocking_dicts[dict_name] = key_map
+                if self._current_func:
+                    self._current_func.blocking_dicts[dict_name] = key_map
+                else:
+                    self.analysis.blocking_dicts[dict_name] = key_map
 
     def _resolve_blocking_ref(self, node: ast.expr) -> tuple[str | None, str | None] | None:
         """Resolve an AST expression to a (module, func_name) pair if it references a known module."""
@@ -1206,6 +1651,9 @@ class CallGraphBuilder(ast.NodeVisitor):
         # Direct name: sleep (from-imported)
         if isinstance(node, ast.Name):
             ref = node.id
+            local_func = self._lookup_function(ref)
+            if local_func:
+                return (None, local_func.symbol or local_func.name)
             if ref in self.analysis.import_froms:
                 imp = self.analysis.import_froms[ref]
                 return (imp.module, imp.name)
@@ -1245,10 +1693,130 @@ class CallGraphBuilder(ast.NodeVisitor):
                         self._current_func.calls.append(prop_call)
                         self.analysis.call_graph[self._current_func.name].append(prop_key)
 
+            if class_name:
+                descriptor_type = self.analysis.class_attr_types.get(class_name, {}).get(attr_name)
+                if descriptor_type:
+                    descriptor_get = f"{descriptor_type}.__get__"
+                    if descriptor_get in self.analysis.functions:
+                        descriptor_call = CallSite(
+                            name=descriptor_get,
+                            line=node.lineno,
+                            col=node.col_offset,
+                            module=None,
+                            object_type=descriptor_type,
+                            caller_function=self._current_func.name,
+                            arg_names=None,
+                            is_property_access=True,
+                        )
+                        self._current_func.calls.append(descriptor_call)
+                        self.analysis.call_graph[self._current_func.name].append(descriptor_get)
+
+            # Attribute access can execute local dynamic hooks. Keep this
+            # evidence-based to avoid turning normal data reads into noise.
+            if class_name:
+                for dunder_name in ("__getattr__", "__getattribute__"):
+                    dunder_key = f"{class_name}.{dunder_name}"
+                    if dunder_key in self.analysis.functions:
+                        dynamic_call = CallSite(
+                            name=dunder_key,
+                            line=node.lineno,
+                            col=node.col_offset,
+                            module=None,
+                            object_type=class_name,
+                            caller_function=self._current_func.name,
+                            arg_names=None,
+                            is_property_access=True,
+                        )
+                        self._current_func.calls.append(dynamic_call)
+                        self.analysis.call_graph[self._current_func.name].append(dunder_key)
+
             # Also check for dunder call patterns: s(5) -> resolve s type to class, trace __call__
             # This is handled in visit_Call via _resolve_call_name
 
         self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        """Track augmented assignment: acc += 1 -> Accumulator.__iadd__."""
+        if self._current_func and isinstance(node.target, ast.Name):
+            class_name = None
+            var_name = node.target.id
+            if var_name in self._current_func.var_types:
+                class_name = self._current_func.var_types[var_name]
+            elif var_name in self.analysis.module_var_types:
+                class_name = self.analysis.module_var_types[var_name]
+
+            op_dunders = {
+                ast.Add: "__iadd__",
+                ast.Sub: "__isub__",
+                ast.Mult: "__imul__",
+                ast.Div: "__itruediv__",
+                ast.FloorDiv: "__ifloordiv__",
+                ast.Mod: "__imod__",
+                ast.Pow: "__ipow__",
+                ast.MatMult: "__imatmul__",
+            }
+            dunder = op_dunders.get(type(node.op))
+            if class_name and dunder:
+                dunder_key = f"{class_name}.{dunder}"
+                if dunder_key in self.analysis.functions:
+                    aug_call = CallSite(
+                        name=dunder_key,
+                        line=node.lineno,
+                        col=node.col_offset,
+                        module=None,
+                        object_type=class_name,
+                        caller_function=self._current_func.name,
+                        arg_names=None,
+                    )
+                    self._current_func.calls.append(aug_call)
+                    self.analysis.call_graph[self._current_func.name].append(dunder_key)
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For) -> None:
+        """Track local iterator dunders used by synchronous for loops."""
+        self._handle_sync_iteration(node.iter)
+        self.generic_visit(node)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        for generator in node.generators:
+            self._handle_sync_iteration(generator.iter)
+        self.generic_visit(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        for generator in node.generators:
+            self._handle_sync_iteration(generator.iter)
+        self.generic_visit(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        for generator in node.generators:
+            self._handle_sync_iteration(generator.iter)
+        self.generic_visit(node)
+
+    def _handle_sync_iteration(self, iter_expr: ast.expr) -> None:
+        if not self._current_func or not isinstance(iter_expr, ast.Name):
+            return
+        var_name = iter_expr.id
+        class_name = None
+        if var_name in self._current_func.var_types:
+            class_name = self._current_func.var_types[var_name]
+        elif var_name in self.analysis.module_var_types:
+            class_name = self.analysis.module_var_types[var_name]
+        if not class_name:
+            return
+        for dunder in ("__iter__", "__next__"):
+            key = f"{class_name}.{dunder}"
+            if key in self.analysis.functions:
+                iter_call = CallSite(
+                    name=key,
+                    line=iter_expr.lineno,
+                    col=iter_expr.col_offset,
+                    module=None,
+                    object_type=class_name,
+                    caller_function=self._current_func.name,
+                    arg_names=None,
+                )
+                self._current_func.calls.append(iter_call)
+                self.analysis.call_graph[self._current_func.name].append(key)
 
     def visit_BinOp(self, node: ast.BinOp) -> None:
         """Track operator overloading: d * 5 -> Delay.__mul__."""
@@ -1324,7 +1892,12 @@ def _post_process_decorator_replacements(analysis: ModuleAnalysis, tree: ast.Mod
                     dec_name = dec.func.id
 
                 if dec_name == decorator_name:
-                    _apply_decorator_replacement(analysis, target.name, wrapper_name)
+                    _apply_decorator_replacement(
+                        analysis,
+                        target.name,
+                        wrapper_name,
+                        decorator_name,
+                    )
 
 
 def _find_wrapper_name(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
@@ -1349,15 +1922,93 @@ def _find_wrapper_name(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str
     return None
 
 
-def _apply_decorator_replacement(analysis: ModuleAnalysis, target_name: str, wrapper_name: str) -> None:
+def _apply_decorator_replacement(
+    analysis: ModuleAnalysis,
+    target_name: str,
+    wrapper_name: str,
+    decorator_name: str | None = None,
+) -> None:
     """Apply decorator replacement: copy wrapper's calls to the decorated function."""
-    analysis.decorator_replacements[target_name] = wrapper_name
+    wrapper_key = wrapper_name
+    if wrapper_key not in analysis.functions and decorator_name:
+        candidates = [
+            symbol
+            for symbol in analysis.functions
+            if (
+                symbol.startswith(f"{decorator_name}.<locals>.")
+                and symbol.endswith(f".<locals>.{wrapper_name}")
+            )
+            or symbol == f"{decorator_name}.<locals>.{wrapper_name}"
+        ]
+        if candidates:
+            wrapper_key = sorted(candidates, key=len)[-1]
 
-    if wrapper_name in analysis.functions and target_name in analysis.functions:
+    analysis.decorator_replacements[target_name] = wrapper_key
+
+    if wrapper_key in analysis.functions and target_name in analysis.functions:
         target_func = analysis.functions[target_name]
-        wrapper_func = analysis.functions[wrapper_name]
+        wrapper_func = analysis.functions[wrapper_key]
         for call in wrapper_func.calls:
             target_func.calls.append(call)
+
+
+def _build_function_summaries(analysis: ModuleAnalysis, max_iterations: int = 8) -> None:
+    """Compute lightweight function summaries after all symbols are collected."""
+    for func in analysis.functions.values():
+        func.summary = FunctionSummary(
+            symbol=func.symbol or func.name,
+            params=func.params.copy(),
+            return_values=[],
+            operations=[
+                CallOperation(
+                    line=call.line,
+                    col=call.col,
+                    confidence=call.confidence,
+                    callable=KnownCallable(
+                        module=call.module,
+                        name=call.name,
+                        receiver_type=call.object_type,
+                        symbol=call.name if call.module is None else None,
+                        offloaded=call.offloaded,
+                    ),
+                )
+                for call in func.calls
+            ],
+        )
+        if func.return_alias:
+            func.summary.return_values.append(
+                KnownCallable(module=func.return_alias[0], name=func.return_alias[1])
+            )
+        elif func.return_type:
+            func.summary.return_values.append(
+                KnownInstance(module=func.return_module, type_name=func.return_type)
+            )
+
+    # A small fixed point propagates return summaries through local factory chains.
+    for _ in range(max_iterations):
+        changed = False
+        for func in analysis.functions.values():
+            if func.return_type or func.return_alias:
+                continue
+            for call in func.calls:
+                if call.module is not None:
+                    continue
+                callee = analysis.functions.get(call.name)
+                if callee is None and call.name in analysis.symbol_aliases:
+                    callee = analysis.functions.get(analysis.symbol_aliases[call.name])
+                if not callee:
+                    continue
+                if callee.return_alias:
+                    func.return_alias = callee.return_alias
+                    changed = True
+                    break
+                if callee.return_type:
+                    func.return_type = callee.return_type
+                    func.return_module = callee.return_module
+                    changed = True
+                    break
+        if not changed:
+            break
 
 
 def analyze_file(filepath: str | Path) -> ModuleAnalysis:
@@ -1367,8 +2018,10 @@ def analyze_file(filepath: str | Path) -> ModuleAnalysis:
     tree = ast.parse(source, filename=str(filepath))
 
     builder = CallGraphBuilder(str(filepath))
+    builder.precollect_definitions(tree)
     builder.visit(tree)
     _post_process_decorator_replacements(builder.analysis, tree)
+    _build_function_summaries(builder.analysis)
 
     return builder.analysis
 
@@ -1377,6 +2030,8 @@ def analyze_source(source: str, filepath: str = "<test>") -> ModuleAnalysis:
     """Analyze source code string."""
     tree = ast.parse(source, filename=filepath)
     builder = CallGraphBuilder(filepath)
+    builder.precollect_definitions(tree)
     builder.visit(tree)
     _post_process_decorator_replacements(builder.analysis, tree)
+    _build_function_summaries(builder.analysis)
     return builder.analysis

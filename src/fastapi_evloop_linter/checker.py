@@ -115,6 +115,18 @@ class EventLoopChecker:
         """Check if a function is a FastAPI endpoint."""
         return "__fastapi_endpoint__" in func.decorators and func.is_async
 
+    def _get_function(self, analysis: ModuleAnalysis, name: str | None) -> FuncDef | None:
+        """Resolve local functions through compatibility aliases and qualified symbols."""
+        if not name:
+            return None
+        func = analysis.functions.get(name)
+        if func is not None:
+            return func
+        alias = analysis.symbol_aliases.get(name)
+        if alias:
+            return analysis.functions.get(alias)
+        return None
+
     def _trace_calls(
         self,
         analysis: ModuleAnalysis,
@@ -128,7 +140,7 @@ class EventLoopChecker:
         if depth > self.max_depth:
             return
 
-        func_key = func.name
+        func_key = func.symbol or func.name
         if func_key in visited:
             return
         visited.add(func_key)
@@ -169,7 +181,7 @@ class EventLoopChecker:
             if call.module is not None:
                 continue
 
-            callee_func = analysis.functions.get(callee_name)
+            callee_func = self._get_function(analysis, callee_name)
             if callee_func is not None:
                 new_chain = call_chain + [callee_name]
                 self._trace_calls(
@@ -236,7 +248,7 @@ class EventLoopChecker:
             # If the call name matches a parameter, follow the mapped arg function
             if call.name in param_to_arg:
                 actual_func_name = param_to_arg[call.name]
-                actual_func = analysis.functions.get(actual_func_name)
+                actual_func = self._get_function(analysis, actual_func_name)
                 if actual_func is not None:
                     new_chain = call_chain + [actual_func_name]
                     self._trace_calls(
