@@ -3,12 +3,32 @@ name = "fastapi-evloop-linter"
 version = "0.1.0"
 description = "Detect event loop blocking calls in FastAPI async endpoints"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "fastapi-evloop-linter contributors" },
+]
+keywords = ["fastapi", "linter", "event-loop", "async", "blocking", "ruff"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Framework :: FastAPI",
+]
 dependencies = []
 
 [project.scripts]
 fastapi-evloop-linter = "fastapi_evloop_linter.cli:main"
 
+[project.urls]
+Repository = "https://github.com/croto-bot/fastapi-evloop-linter"
+
 [build-system]
-requires = ["uv_build>=0.11.6,<0.12.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"

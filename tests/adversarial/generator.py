@@ -63,7 +63,11 @@ def generate_all_cases() -> list[TestCase]:
     cases.extend(_blocking_constructor_cases())
     cases.extend(_higher_order_cases())
     cases.extend(_property_blocking_cases())
-    cases.extend(_shutil_blocking_cases())
+    cases.extend(_higher_order_extra_cases())
+    cases.extend(_async_dunder_cases())
+    cases.extend(_class_attr_cases())
+    cases.extend(_decorator_factory_cases())
+    cases.extend(_stdlib_blocking_cases())
     return cases
 
 
@@ -1334,256 +1338,200 @@ def _property_blocking_cases() -> list[TestCase]:
     ]
 
 
-def _shutil_blocking_cases() -> list[TestCase]:
-    """Cases with shutil blocking operations."""
+def _higher_order_extra_cases() -> list[TestCase]:
+    """Cases with filter/sorted/list.sort as higher-order callers."""
     return [
         TestCase(
-            name="shutil_copytree_direct",
+            name="filter_blocking",
             source=textwrap.dedent("""\
-                import shutil
+                import time
                 from fastapi import FastAPI
                 app = FastAPI()
 
-                @app.post("/backup")
-                async def backup_files():
-                    shutil.copytree("/data/src", "/data/backup")
-                    return {"status": "backed up"}
-            """),
-            difficulty=1,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="Direct shutil.copytree() in async endpoint",
-        ),
-        TestCase(
-            name="shutil_rmtree_direct",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
+                def is_ready(item):
+                    time.sleep(0.1)
+                    return item > 0
 
-                @app.delete("/cleanup")
-                async def cleanup():
-                    shutil.rmtree("/tmp/old_data")
-                    return {"status": "cleaned"}
+                @app.get("/filter")
+                async def filter_endpoint():
+                    results = list(filter(is_ready, [1, -2, 3]))
+                    return {"count": len(results)}
             """),
-            difficulty=1,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="Direct shutil.rmtree() in async endpoint",
-        ),
-        TestCase(
-            name="shutil_copy_direct",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/copy")
-                async def copy_file():
-                    shutil.copy("/data/file.txt", "/backup/file.txt")
-                    return {"status": "copied"}
-            """),
-            difficulty=1,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="Direct shutil.copy() in async endpoint",
-        ),
-        TestCase(
-            name="shutil_move_direct",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/move")
-                async def move_file():
-                    shutil.move("/data/old.txt", "/archive/old.txt")
-                    return {"status": "moved"}
-            """),
-            difficulty=1,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="Direct shutil.move() in async endpoint",
-        ),
-        TestCase(
-            name="shutil_archive_direct",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/archive")
-                async def create_archive():
-                    shutil.make_archive("/backup/data", "zip", "/data")
-                    return {"status": "archived"}
-            """),
-            difficulty=1,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="Direct shutil.make_archive() in async endpoint",
-        ),
-        TestCase(
-            name="shutil_unpack_archive_direct",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/extract")
-                async def extract_archive():
-                    shutil.unpack_archive("/upload/data.zip", "/data/extracted")
-                    return {"status": "extracted"}
-            """),
-            difficulty=1,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="Direct shutil.unpack_archive() in async endpoint",
-        ),
-        TestCase(
-            name="shutil_multiple_operations",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/migrate")
-                async def migrate_data():
-                    shutil.copytree("/data/src", "/data/backup")
-                    shutil.rmtree("/data/src")
-                    return {"status": "migrated"}
-            """),
-            difficulty=1,
-            expected_violations=2,
-            expected_min_depth=0,
-            category="shutil",
-            description="Multiple shutil operations in one endpoint",
-        ),
-        TestCase(
-            name="shutil_deep_chain",
-            source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                def backup_data(src, dst):
-                    shutil.copytree(src, dst)
-
-                @app.post("/backup")
-                async def backup_endpoint():
-                    backup_data("/data/src", "/data/backup")
-                    return {"status": "ok"}
-            """),
-            difficulty=3,
+            difficulty=7,
             expected_violations=1,
             expected_min_depth=1,
-            category="shutil",
-            description="shutil.copytree() through helper function (depth 1)",
+            category="higher_order_extra",
+            description="filter() with blocking predicate",
         ),
         TestCase(
-            name="shutil_deep_chain_3",
+            name="sorted_blocking",
             source=textwrap.dedent("""\
-                import shutil
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                def do_archive(src, dst):
-                    shutil.make_archive(dst, "zip", src)
-
-                def run_backup(src, dst):
-                    do_archive(src, dst)
-
-                @app.post("/backup")
-                async def backup_endpoint():
-                    run_backup("/data", "/backup")
-                    return {"status": "ok"}
-            """),
-            difficulty=4,
-            expected_violations=1,
-            expected_min_depth=2,
-            category="shutil",
-            description="shutil.make_archive() through 2 helper functions (depth 2)",
-        ),
-        TestCase(
-            name="shutil_aliased_import",
-            source=textwrap.dedent("""\
-                import shutil as sh
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/backup")
-                async def backup_files():
-                    sh.copytree("/data/src", "/data/backup")
-                    return {"status": "backed up"}
-            """),
-            difficulty=3,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="shutil imported as alias, then sh.copytree() called",
-        ),
-        TestCase(
-            name="shutil_from_import",
-            source=textwrap.dedent("""\
-                from shutil import copytree
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.post("/backup")
-                async def backup_files():
-                    copytree("/data/src", "/data/backup")
-                    return {"status": "backed up"}
-            """),
-            difficulty=2,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="from shutil import copytree, then copytree() called",
-        ),
-        TestCase(
-            name="shutil_from_import_aliased",
-            source=textwrap.dedent("""\
-                from shutil import rmtree as remove_tree
-                from fastapi import FastAPI
-                app = FastAPI()
-
-                @app.delete("/cleanup")
-                async def cleanup():
-                    remove_tree("/tmp/old_data")
-                    return {"status": "cleaned"}
-            """),
-            difficulty=4,
-            expected_violations=1,
-            expected_min_depth=0,
-            category="shutil",
-            description="from shutil import rmtree as remove_tree",
-        ),
-        TestCase(
-            name="shutil_mixed_with_other_blocking",
-            source=textwrap.dedent("""\
-                import shutil
                 import time
-                import requests
                 from fastapi import FastAPI
                 app = FastAPI()
 
-                @app.post("/heavy")
-                async def heavy_operation():
-                    time.sleep(1)
-                    requests.get("https://example.com")
-                    shutil.copytree("/data/src", "/data/backup")
-                    return {"status": "done"}
+                def slow_key(item):
+                    time.sleep(0.1)
+                    return item["score"]
+
+                @app.get("/sorted")
+                async def sorted_endpoint():
+                    results = sorted([{"score": 1}, {"score": 2}], key=slow_key)
+                    return {"results": results}
             """),
-            difficulty=1,
-            expected_violations=3,
+            difficulty=7,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="higher_order_extra",
+            description="sorted() with blocking key function",
+        ),
+    ]
+
+
+def _async_dunder_cases() -> list[TestCase]:
+    """Cases with async context managers (__aenter__)."""
+    return [
+        TestCase(
+            name="async_context_manager",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                class AsyncTimer:
+                    async def __aenter__(self):
+                        time.sleep(1)
+                        return self
+                    async def __aexit__(self, *args):
+                        pass
+
+                @app.get("/actx")
+                async def actx_endpoint():
+                    async with AsyncTimer():
+                        pass
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="async_dunder",
+            description="Blocking call in __aenter__ of async context manager",
+        ),
+    ]
+
+
+def _class_attr_cases() -> list[TestCase]:
+    """Cases where blocking functions are stored as class attributes."""
+    return [
+        TestCase(
+            name="class_attr_blocking",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def wait():
+                    time.sleep(1)
+
+                class Runner:
+                    action = wait
+
+                r = Runner()
+
+                @app.get("/class-attr")
+                async def class_attr_endpoint():
+                    r.action()
+                    return {"ok": True}
+            """),
+            difficulty=8,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="class_attr",
+            description="Blocking function stored as class attribute",
+        ),
+    ]
+
+
+def _decorator_factory_cases() -> list[TestCase]:
+    """Cases with decorator factories (decorators with arguments)."""
+    return [
+        TestCase(
+            name="decorator_with_args",
+            source=textwrap.dedent("""\
+                import time
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                def retry(n):
+                    def decorator(func):
+                        def wrapper(*args, **kwargs):
+                            for _ in range(n):
+                                time.sleep(1)
+                            return func(*args, **kwargs)
+                        return wrapper
+                    return decorator
+
+                @retry(3)
+                def fetch():
+                    return 42
+
+                @app.get("/retry")
+                async def retry_endpoint():
+                    result = fetch()
+                    return {"result": result}
+            """),
+            difficulty=9,
+            expected_violations=1,
+            expected_min_depth=1,
+            category="decorator_factory",
+            description="Decorator with arguments that adds blocking calls",
+        ),
+    ]
+
+
+def _stdlib_blocking_cases() -> list[TestCase]:
+    """Cases with stdlib blocking patterns not yet in the blockers registry."""
+    return [
+        TestCase(
+            name="queue_get",
+            source=textwrap.dedent("""\
+                import queue
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                q = queue.Queue()
+
+                @app.get("/queue")
+                async def queue_endpoint():
+                    item = q.get()
+                    return {"item": item}
+            """),
+            difficulty=5,
+            expected_violations=1,
             expected_min_depth=0,
-            category="shutil",
-            description="shutil mixed with time.sleep and requests.get",
+            category="stdlib_blocking",
+            description="queue.Queue.get() blocks the event loop",
+        ),
+        TestCase(
+            name="lock_acquire",
+            source=textwrap.dedent("""\
+                import threading
+                from fastapi import FastAPI
+                app = FastAPI()
+
+                lock = threading.Lock()
+
+                @app.get("/lock")
+                async def lock_endpoint():
+                    lock.acquire()
+                    lock.release()
+                    return {"ok": True}
+            """),
+            difficulty=5,
+            expected_violations=1,
+            expected_min_depth=0,
+            category="stdlib_blocking",
+            description="threading.Lock.acquire() blocks the event loop",
         ),
     ]
 

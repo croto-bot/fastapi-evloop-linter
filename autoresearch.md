@@ -79,3 +79,6 @@ Added 13 adversarial cases that exploit blind spots the linter currently misses:
 - **Result**: 100% detection rate (0 missed, 0 false positives) across 44 adversarial test cases
 - **Hardened**: Added 11 more adversarial cases (router decorators, depth 7 chains, map callbacks, builtin open, aliased modules) — all pass
 - **New baseline**: 13 missed out of 63 violations (79.4% detection rate) with 13 new blind-spot cases
+- **Fix blind spots**: Added variable alias tracking (var_aliases), cross-function return tracking (returns_blocking), class dunder resolution (__call__, __enter__, __init__, __post_init__, operator overloading), decorator replacement detection, dict dispatch, map() higher-order, property access tracking, and module-level var type tracking
+- **Result**: 100% detection rate (0 missed, 0 false positives) across 57 adversarial test cases (63 violations)
+- **Round 2**: Added 7 more adversarial cases (filter/sorted, async __aenter__, decorator factories, class attributes, queue.Queue, threading.Lock) — all 64 cases pass (70 violations, 0 missed, 0 false positives)
