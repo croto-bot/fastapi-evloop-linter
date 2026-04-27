@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .blockers import is_blocking_call, BlockingPattern
+from .classifier import classify_call, Verdict
 from .callgraph import (
     ModuleAnalysis,
     FuncDef,
@@ -32,7 +32,7 @@ class Violation:
     col: int
     message: str
     severity: str  # "error" or "warning"
-    blocking_pattern: BlockingPattern | None = None
+    reason: str = ""
     # Chain from endpoint to the blocking call
     call_chain: list[str] = field(default_factory=list)
     # How deep in the call tree this was found
@@ -134,21 +134,30 @@ class EventLoopChecker:
         visited.add(func_key)
 
         for call in func.calls:
-            # Check if this call is a known blocking pattern
-            blocking = is_blocking_call(
-                func_name=call.name,
-                module=call.module,
-                object_type=call.object_type,
+            # Classify this call generically.
+            verdict, reason = classify_call(
+                call.module,
+                call.name,
+                call.object_type,
+                analysis,
             )
 
-            if blocking:
+            if verdict == Verdict.BLOCKING:
+                if call.module:
+                    full_name = (
+                        f"{call.module}.{call.object_type}.{call.name}"
+                        if call.object_type
+                        else f"{call.module}.{call.name}"
+                    )
+                else:
+                    full_name = call.name
                 violation = Violation(
                     filepath=analysis.filepath,
                     line=call.line,
                     col=call.col,
-                    message=blocking.message or f"Blocking call: {blocking.full_name}",
-                    severity=blocking.severity,
-                    blocking_pattern=blocking,
+                    message=f"Blocking call: {full_name} ({reason})",
+                    severity="error",
+                    reason=reason,
                     call_chain=call_chain.copy(),
                     depth=depth,
                 )

@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
                     "message": v.message,
                     "depth": v.depth,
                     "call_chain": v.call_chain,
-                    "pattern": v.blocking_pattern.full_name if v.blocking_pattern else None,
+                    "reason": v.reason,
                 }
                 for v in violations
             ],
