@@ -53,6 +53,8 @@ class FuncDef:
     replaces_func: str | None = None
     # Blocking reference returned by this function: (module, func_name) or None
     returns_blocking: tuple[str | None, str | None] | None = None
+    # Inner functions defined in this function's body (set of names)
+    inner_functions: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -95,6 +97,9 @@ class ModuleAnalysis:
     # Instance attribute types: class_name -> {attr_name -> type_name}
     # e.g. self.conn = sqlite3.connect(...) -> {"UserRepository": {"conn": "connect"}}
     class_attr_types: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Module-level variable aliases: var_name -> (module, func_name)
+    # e.g. query_runner = create_query_runner(...) -> {"query_runner": (None, "run_query")}
+    module_var_aliases: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
 
 
 class CallGraphBuilder(ast.NodeVisitor):
@@ -173,6 +178,10 @@ class CallGraphBuilder(ast.NodeVisitor):
                 call_key = f"{var_type}.__call__"
                 if call_key in self.analysis.functions:
                     return None, call_key, var_type
+            # Check module-level var aliases (closure/factory pattern)
+            if name in self.analysis.module_var_aliases:
+                alias_mod, alias_name = self.analysis.module_var_aliases[name]
+                return alias_mod, alias_name, None
             # Bare-name fallback: search imported modules via runtime introspection
             # for an exported callable matching this name. e.g. `import time` then
             # bare `sleep(5)` (semantically wrong but legal-looking) — we infer
@@ -366,6 +375,10 @@ class CallGraphBuilder(ast.NodeVisitor):
                             self._current_func.var_module[target.id] = (
                                 self._current_func.var_module[base]
                             )
+                    # Check if the method returns a blocking reference (closure/factory)
+                    callee = self.analysis.functions.get(func.attr)
+                    if callee and callee.returns_blocking:
+                        self._current_func.var_aliases[target.id] = callee.returns_blocking
 
             # Handle variable reassignment: propagate type/module from source
             # e.g., conn = server  ->  copy server's type/module to conn
@@ -693,11 +706,9 @@ class CallGraphBuilder(ast.NodeVisitor):
         # Store function - but check if a decorator wrapper already took this name
         self.analysis.functions[node.name] = func
 
-        # Check if this function is a decorator wrapper that replaces the original.
-        # Pattern: any inner function returned by its enclosing function is a wrapper —
-        # the name "wrapper" is not required; _post_process_decorator_replacements handles
-        # this structurally. Mark is_decorator_wrapper for any nested function definition.
+        # Register this function as an inner function of its parent scope
         if self._current_func:
+            self._current_func.inner_functions.add(node.name)
             self._current_func.is_decorator_wrapper = True
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -1007,6 +1018,11 @@ class CallGraphBuilder(ast.NodeVisitor):
                             self.analysis.module_var_module[target.id] = (
                                 self.analysis.import_froms[func.id].module
                             )
+                        # Check if the called function returns a blocking reference
+                        # (closure/factory pattern at module level)
+                        callee = self.analysis.functions.get(func.id)
+                        if callee and callee.returns_blocking:
+                            self.analysis.module_var_aliases[target.id] = callee.returns_blocking
                     elif isinstance(func, ast.Attribute):
                         # e.g., q = queue.Queue() -> type=Queue, source module=queue
                         self.analysis.module_var_types[target.id] = func.attr
@@ -1016,6 +1032,10 @@ class CallGraphBuilder(ast.NodeVisitor):
                                 self.analysis.module_var_module[target.id] = (
                                     self.analysis.imports[base].module
                                 )
+                        # Check if the method returns a blocking reference
+                        callee = self.analysis.functions.get(func.attr)
+                        if callee and callee.returns_blocking:
+                            self.analysis.module_var_aliases[target.id] = callee.returns_blocking
         self.generic_visit(node)
 
     def visit_With(self, node: ast.With) -> None:
@@ -1126,6 +1146,24 @@ class CallGraphBuilder(ast.NodeVisitor):
             resolved = self._resolve_blocking_ref(node.value)
             if resolved:
                 self._current_func.returns_blocking = resolved
+            elif isinstance(node.value, ast.Name) and node.value.id in self._current_func.inner_functions:
+                # Returning a locally-defined inner function (closure/factory pattern)
+                self._current_func.returns_blocking = (None, node.value.id)
+            elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+                # Returning a call to a locally-defined inner function:
+                #   return inner_func(args)
+                # The inner function may itself return a closure.
+                callee_name = node.value.func.id
+                if callee_name in self._current_func.inner_functions:
+                    callee = self.analysis.functions.get(callee_name)
+                    if callee and callee.returns_blocking:
+                        self._current_func.returns_blocking = callee.returns_blocking
+                # Also handle returning a call to a regular local function
+                # that has returns_blocking set (covers indirect factory chains)
+                elif callee_name in self.analysis.functions:
+                    callee = self.analysis.functions[callee_name]
+                    if callee.returns_blocking:
+                        self._current_func.returns_blocking = callee.returns_blocking
         self.generic_visit(node)
 
     def _track_blocking_dict(self, node: ast.Assign) -> None:
