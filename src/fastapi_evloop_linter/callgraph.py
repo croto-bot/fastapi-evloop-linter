@@ -89,6 +89,12 @@ class ModuleAnalysis:
     module_var_module: dict[str, str] = field(default_factory=dict)
     # Class attributes that reference known functions: class_name -> {attr_name: func_name}
     class_func_attrs: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Instance attribute source modules: class_name -> {attr_name -> module}
+    # e.g. self.conn = sqlite3.connect(...) -> {"UserRepository": {"conn": "sqlite3"}}
+    class_attr_modules: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Instance attribute types: class_name -> {attr_name -> type_name}
+    # e.g. self.conn = sqlite3.connect(...) -> {"UserRepository": {"conn": "connect"}}
+    class_attr_types: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 class CallGraphBuilder(ast.NodeVisitor):
@@ -98,6 +104,7 @@ class CallGraphBuilder(ast.NodeVisitor):
         self.filepath = filepath
         self.analysis = ModuleAnalysis(filepath=filepath)
         self._current_func: FuncDef | None = None
+        self._current_class: str | None = None
         self._scope_stack: list[FuncDef] = []
 
     def _get_decorator_name(self, node: ast.expr) -> str:
@@ -227,6 +234,37 @@ class CallGraphBuilder(ast.NodeVisitor):
                     cur = cur.value
                 if isinstance(cur, ast.Name):
                     base = cur.id
+
+                    # Resolve self.xxx.method() and obj.xxx.method()
+                    # where self.xxx was tracked via class_attr_modules.
+                    if len(parts) == 1:
+                        if base == "self" and self._current_class:
+                            class_modules = self.analysis.class_attr_modules.get(
+                                self._current_class, {}
+                            )
+                            class_types = self.analysis.class_attr_types.get(
+                                self._current_class, {}
+                            )
+                            if parts[0] in class_modules:
+                                module = class_modules[parts[0]]
+                                obj_type = class_types.get(parts[0])
+                                return module, attr_name, obj_type
+                        elif (
+                            self._current_func
+                            and base in self._current_func.var_types
+                        ):
+                            obj_class = self._current_func.var_types[base]
+                            class_modules = self.analysis.class_attr_modules.get(
+                                obj_class, {}
+                            )
+                            class_types = self.analysis.class_attr_types.get(
+                                obj_class, {}
+                            )
+                            if parts[0] in class_modules:
+                                module = class_modules[parts[0]]
+                                obj_type = class_types.get(parts[0])
+                                return module, attr_name, obj_type
+
                     # Try matching the longest dotted-import prefix:
                     # `import urllib.request` registers key 'urllib.request',
                     # so for urllib.request.urlopen we want module='urllib.request'.
@@ -346,6 +384,28 @@ class CallGraphBuilder(ast.NodeVisitor):
             # Track variable aliasing to blocking functions
             # e.g. f = time.sleep  or  f = requests.get
             self._track_var_alias(target.id, value)
+
+        # Track: self.xxx = Call() or obj.xxx = Call()
+        # Stores the source module per class so self.xxx.method() can resolve.
+        if isinstance(target, ast.Attribute) and isinstance(value, ast.Call):
+            attr_name = target.attr
+            obj = target.value
+
+            if isinstance(obj, ast.Name):
+                obj_name = obj.id
+                class_name = None
+
+                if obj_name == "self" and self._current_class:
+                    class_name = self._current_class
+                elif obj_name in self._current_func.var_types:
+                    class_name = self._current_func.var_types[obj_name]
+
+                if class_name:
+                    module, func_name, _ = self._resolve_call_name(value)
+                    if module:
+                        self.analysis.class_attr_modules.setdefault(class_name, {})[attr_name] = module
+                    if func_name:
+                        self.analysis.class_attr_types.setdefault(class_name, {})[attr_name] = func_name
 
     def _track_var_alias(self, var_name: str, value: ast.expr) -> None:
         """Track when a variable is assigned a reference to a blocking function."""
@@ -505,6 +565,9 @@ class CallGraphBuilder(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Track class definitions and their methods."""
+        prev_class = self._current_class
+        self._current_class = node.name
+
         methods = set()
         properties = set()
         for item in node.body:
@@ -596,6 +659,8 @@ class CallGraphBuilder(ast.NodeVisitor):
         for item in node.body:
             if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.visit(item)
+
+        self._current_class = prev_class
 
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
