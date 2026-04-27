@@ -44,6 +44,9 @@ class FuncDef:
     params: list[str] = field(default_factory=list)
     # Variable aliases: var_name -> (module, func_name) for blocking function refs
     var_aliases: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
+    # Source module for function-local vars constructed from `mod.Cls()`.
+    # var_name -> module name (e.g. server = smtplib.SMTP() -> "server" -> "smtplib").
+    var_module: dict[str, str] = field(default_factory=dict)
     # Whether this function is a decorator wrapper that replaces the original
     is_decorator_wrapper: bool = False
     # The original function name this wrapper replaces (set when used as decorator)
@@ -196,7 +199,9 @@ class CallGraphBuilder(ast.NodeVisitor):
                         if attr_name in self.analysis.class_func_attrs[obj_type]:
                             real_func = self.analysis.class_func_attrs[obj_type][attr_name]
                             return None, real_func, None
-                    return None, attr_name, obj_type
+                    # Propagate source module if tracked (e.g. smtplib.SMTP() -> "smtplib")
+                    src_mod = self._current_func.var_module.get(base_name)
+                    return src_mod, attr_name, obj_type
                 # Check module-level var types
                 if base_name in self.analysis.module_var_types:
                     obj_type = self.analysis.module_var_types[base_name]
@@ -289,13 +294,19 @@ class CallGraphBuilder(ast.NodeVisitor):
 
                 elif isinstance(func, ast.Attribute):
                     self._current_func.var_types[target.id] = func.attr
-                    # Also check if this is module.ClassName() pattern
-                    # e.g., q = queue.Queue() -> need to track module context
+                    # Track the source module so method calls on this variable
+                    # can be resolved back to the module for classification.
+                    # e.g., server = smtplib.SMTP() -> var_module["server"] = "smtplib"
                     if isinstance(func.value, ast.Name):
                         base = func.value.id
                         if base in self.analysis.imports:
-                            # Store as "module.ClassName" for richer matching
-                            pass
+                            self._current_func.var_module[target.id] = (
+                                self.analysis.imports[base].module
+                            )
+                        elif base in self.analysis.import_froms:
+                            self._current_func.var_module[target.id] = (
+                                self.analysis.import_froms[base].module
+                            )
 
             # Track variable aliasing to blocking functions
             # e.g. f = time.sleep  or  f = requests.get
