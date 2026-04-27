@@ -50,7 +50,15 @@ def _get_decorator_base(dec_ast: ast.expr) -> str | None:
 
 
 def _is_third_party_module(module_name: str | None) -> bool:
-    """True if the module exists and is third-party (not stdlib, not project-local)."""
+    """True if the module is third-party (not stdlib, not project-local).
+
+    Accepts both installed third-party modules and not-installed ones: the
+    linter often runs in an isolated environment (e.g. ``uvx --from git+...``)
+    where the user's web framework (fastapi/starlette/litestar/...) isn't
+    importable. We still want to recognize ``@router.post(...)`` style
+    decorators as endpoints in that case, because the user code clearly
+    imports a non-stdlib name.
+    """
     if not module_name:
         return False
 
@@ -59,7 +67,7 @@ def _is_third_party_module(module_name: str | None) -> bool:
         return False
 
     origin = resolve_module_origin(module_name)
-    return origin == ModuleOrigin.THIRD_PARTY
+    return origin in (ModuleOrigin.THIRD_PARTY, ModuleOrigin.NOT_INSTALLED)
 
 
 def _resolve_base_to_module(
