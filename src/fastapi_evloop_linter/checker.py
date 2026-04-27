@@ -170,6 +170,9 @@ class EventLoopChecker:
         visited.add(func_key)
 
         for call in func.calls:
+            if call.async_context_manager_factory and call.module is not None:
+                continue
+
             # Classify this call generically.
             verdict, reason = classify_call(
                 call.module,

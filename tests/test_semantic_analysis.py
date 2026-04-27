@@ -145,6 +145,34 @@ def test_third_party_exception_constructor_is_safe_when_attribute_probe_fails(mo
     assert "exception class" in reason
 
 
+def test_external_async_context_manager_factory_is_not_reported() -> None:
+    source = """\
+import aioboto3
+
+session = aioboto3.Session()
+
+async def upload():
+    async with session.client("s3") as s3:
+        await s3.put_object(Bucket="bucket", Key="key", Body=b"data")
+"""
+    assert_clean(source)
+
+
+def test_local_async_context_manager_factory_still_traces_body() -> None:
+    source = """\
+import time
+
+def make_manager():
+    time.sleep(1)
+    return manager
+
+async def upload():
+    async with make_manager():
+        return None
+"""
+    assert_reports(source, "time.sleep")
+
+
 def test_bound_method_variable_reports_blocking_body() -> None:
     source = """\
 import time

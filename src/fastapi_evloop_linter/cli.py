@@ -8,7 +8,35 @@ import sys
 from pathlib import Path
 
 from .checker import EventLoopChecker, format_violation, LintResult
-from .env import setup_sys_path
+from .env import find_project_root, setup_sys_path
+
+
+def expand_lint_paths(paths: list[Path]) -> list[Path]:
+    """Expand common app-layout targets to include async work in sibling src/."""
+    expanded: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        key = path.resolve() if path.exists() else path
+        if key not in seen:
+            seen.add(key)
+            expanded.append(path)
+
+    for path in paths:
+        add(path)
+        root = find_project_root(path)
+        if root is None:
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        app_dir = root / "app"
+        src_dir = root / "src"
+        if src_dir.is_dir() and (resolved == app_dir.resolve()):
+            add(src_dir)
+
+    return expanded
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,8 +88,10 @@ def main(argv: list[str] | None = None) -> int:
     # the introspection layer can actually import the user's project-local
     # modules and third-party deps. Must happen BEFORE any classifier code
     # runs, since introspect.py memoizes module-origin lookups.
+    lint_paths = expand_lint_paths([Path(p) for p in args.paths])
+
     if not args.no_env_discovery:
-        env_summary = setup_sys_path([Path(p) for p in args.paths])
+        env_summary = setup_sys_path(lint_paths)
         if args.show_env:
             print("env discovery:", file=sys.stderr)
             for r in env_summary["project_roots"]:
@@ -74,14 +104,13 @@ def main(argv: list[str] | None = None) -> int:
     checker = EventLoopChecker(max_depth=args.max_depth)
     result = LintResult()
 
-    for path_str in args.paths:
-        path = Path(path_str)
+    for path in lint_paths:
         if path.is_dir():
             result.merge(checker.check_directory(path))
         elif path.is_file():
             result.merge(checker.check_file(path))
         else:
-            print(f"Warning: {path_str} not found", file=sys.stderr)
+            print(f"Warning: {path} not found", file=sys.stderr)
 
     # Filter by severity
     violations = result.violations

@@ -45,6 +45,8 @@ class CallSite:
     confidence: Confidence = Confidence.HIGH
     # True when the callable is deliberately offloaded from the event loop.
     offloaded: bool = False
+    # True for the outer factory call in `async with factory() as value`.
+    async_context_manager_factory: bool = False
 
 
 @dataclass
@@ -149,6 +151,7 @@ class CallGraphBuilder(ast.NodeVisitor):
         self._current_func: FuncDef | None = None
         self._current_class: str | None = None
         self._scope_stack: list[FuncDef] = []
+        self._async_context_factory_calls: set[int] = set()
 
     def _symbol_for(
         self,
@@ -1158,6 +1161,7 @@ class CallGraphBuilder(ast.NodeVisitor):
             object_type=obj_type,
             caller_function=self._current_func.name,
             arg_names=arg_names,
+            async_context_manager_factory=id(node) in self._async_context_factory_calls,
         )
 
         self._current_func.calls.append(call_site)
@@ -1434,6 +1438,9 @@ class CallGraphBuilder(ast.NodeVisitor):
 
     def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
         """Track async with-statement context manager calls."""
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Call):
+                self._async_context_factory_calls.add(id(item.context_expr))
         self._handle_context_manager(node)
         self.generic_visit(node)
 
