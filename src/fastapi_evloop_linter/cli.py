@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .checker import EventLoopChecker, format_violation, LintResult
+from .env import setup_sys_path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,8 +39,37 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
         help="Which severities to report (default: all)",
     )
+    parser.add_argument(
+        "--no-env-discovery",
+        action="store_true",
+        help=(
+            "Skip auto-discovery of the target's project root and venv. "
+            "Use this if env discovery picks up something unintended; "
+            "the linter will then fall back to name-based heuristics."
+        ),
+    )
+    parser.add_argument(
+        "--show-env",
+        action="store_true",
+        help="Print the project roots and site-packages dirs added to sys.path.",
+    )
 
     args = parser.parse_args(argv)
+
+    # Augment sys.path with the target's project root + venv site-packages so
+    # the introspection layer can actually import the user's project-local
+    # modules and third-party deps. Must happen BEFORE any classifier code
+    # runs, since introspect.py memoizes module-origin lookups.
+    if not args.no_env_discovery:
+        env_summary = setup_sys_path([Path(p) for p in args.paths])
+        if args.show_env:
+            print("env discovery:", file=sys.stderr)
+            for r in env_summary["project_roots"]:
+                print(f"  project_root: {r}", file=sys.stderr)
+            for sp in env_summary["site_packages"]:
+                print(f"  site_packages: {sp}", file=sys.stderr)
+            if not env_summary["project_roots"] and not env_summary["site_packages"]:
+                print("  (nothing discovered — falling back to heuristics)", file=sys.stderr)
 
     checker = EventLoopChecker(max_depth=args.max_depth)
     result = LintResult()
