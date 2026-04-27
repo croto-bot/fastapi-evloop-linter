@@ -643,6 +643,7 @@ import urllib.parse
 import aiofiles
 import aiohttp
 import socketio
+from cryptography.fernet import Fernet
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy import Boolean, Column, Integer, String
 
@@ -667,18 +668,24 @@ async def query_builder_only(model, data):
         select(model)
         .filter_by(id=payload.get("id"))
         .filter(model.name != None)
+        .filter(model.name.ilike("%x%"))
+        .filter(model.name.startswith("x"))
         .where(and_(model.created_at <= now, or_(model.updated_at <= now_ns)))
         .outerjoin(model.owner)
+        .having(func.count() > 1)
+        .with_for_update()
         .order_by(model.created_at.desc())
         .limit(10)
         .offset(0)
     )
+    token = Fernet(b"0" * 32)
+    secret = token.decrypt(token.encrypt(b"ok"))
     count_stmt = select(func.count()).select_from(model).scalar_subquery()
     update_stmt = update(model).filter_by(id=payload.get("id")).values(name="x")
     delete_stmt = delete(model).filter_by(id=payload.get("id"))
     raw = text("SELECT 1")
     columns = [Column("id", Integer), Column("name", String), Column("active", Boolean)]
-    return stmt, count_stmt, update_stmt, delete_stmt, raw, timeout, url, escaped, choice, is_coro, sig, columns
+    return stmt, count_stmt, update_stmt, delete_stmt, raw, timeout, url, escaped, choice, is_coro, sig, columns, secret
 """
     assert_clean(source)
 
@@ -694,3 +701,47 @@ async def healthcheck_with_db():
     found = messages(source)
     assert any("ScopedSession.execute" in message for message in found), found
     assert not any("sqlalchemy.text" in message for message in found), found
+
+
+def test_third_party_constructors_and_in_memory_helpers_are_clean() -> None:
+    source = """\
+from io import BytesIO
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.rate_limiters import InMemoryRateLimiter
+from msal import ConfidentialClientApplication
+from pandas import notna
+from pydantic_settings import BaseSettings
+
+class Config(BaseSettings):
+    value: str = "ok"
+
+async def build_objects(value):
+    message = HumanMessage(content="hello")
+    model = ChatOpenAI(model="gpt-4o-mini")
+    limiter = InMemoryRateLimiter(requests_per_second=1)
+    client = ConfidentialClientApplication("client-id")
+    config = Config()
+    data = BytesIO(b"ok")
+    return message, model, limiter, client, config, data.getvalue(), notna(value)
+"""
+    assert_clean(source)
+
+
+def test_future_result_reports_blocking_wait_not_submit() -> None:
+    source = """\
+from concurrent.futures import ThreadPoolExecutor
+
+def work():
+    return "ok"
+
+async def transcribe():
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(work)]
+        for future in futures:
+            future.result()
+"""
+    found = messages(source)
+    assert any("future.result waits synchronously" in message for message in found), found
+    assert any("future.result" in message for message in found), found
+    assert not any("submit" in message for message in found), found

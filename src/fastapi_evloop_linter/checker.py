@@ -188,6 +188,8 @@ class EventLoopChecker:
                         if call.object_type
                         else f"{call.module}.{call.name}"
                     )
+                elif call.object_type:
+                    full_name = f"{call.object_type}.{call.name}"
                 else:
                     full_name = call.name
                 violation = Violation(

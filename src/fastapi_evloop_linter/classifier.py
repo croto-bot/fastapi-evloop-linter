@@ -76,6 +76,9 @@ SAFE_STDLIB_FUNCTIONS: frozenset[tuple[str, str]] = frozenset({
 # Method/property accesses on stdlib classes that are pure (no I/O).
 # Format: (module, class, attr).
 SAFE_STDLIB_METHODS: frozenset[tuple[str, str, str]] = frozenset({
+    ("concurrent.futures", "ThreadPoolExecutor", "submit"),
+    ("io", "BytesIO", "getvalue"),
+
     # str methods on values returned by known-safe serializers.
     ("json", "dumps", "encode"),
     ("json", "loads", "get"),
@@ -154,12 +157,15 @@ SAFE_SQLALCHEMY_QUERY_SYMBOLS: frozenset[str] = frozenset({
     "func",
     "get",
     "group_by",
+    "having",
+    "ilike",
     "join",
     "json_extract",
     "json_extract_path_text",
     "label",
     "limit",
     "lower",
+    "like",
     "max",
     "offset",
     "or_",
@@ -188,6 +194,8 @@ SAFE_SQLALCHEMY_QUERY_SYMBOLS: frozenset[str] = frozenset({
     "Integer",
     "JSON",
     "String",
+    "startswith",
+    "with_for_update",
 })
 
 SYNC_DB_METHODS: frozenset[str] = frozenset({
@@ -207,6 +215,24 @@ SYNC_DB_OBJECT_HINTS: frozenset[str] = frozenset({
     "ScopedSession",
     "Session",
 })
+
+SYNC_FUTURE_OBJECT_HINTS: frozenset[str] = frozenset({
+    "Future",
+    "future",
+    "fut",
+})
+
+SAFE_THIRD_PARTY_FUNCTIONS: frozenset[tuple[str, str]] = frozenset({
+    ("pandas", "isna"),
+    ("pandas", "isnull"),
+    ("pandas", "notna"),
+    ("pandas", "notnull"),
+})
+
+
+def _looks_like_constructor(name: str) -> bool:
+    """Best-effort signal for class construction, which is usually in-memory."""
+    return bool(name) and name[0].isupper()
 
 
 def classify_call(
@@ -246,6 +272,12 @@ def classify_call(
     }:
         return Verdict.SAFE, f"{module}.{func_name} is pydantic validation metadata"
 
+    if module and module.split(".")[0] == "cryptography" and func_name in {
+        "decrypt",
+        "encrypt",
+    }:
+        return Verdict.SAFE, f"{module}.{func_name} is in-memory cryptographic work"
+
     if module and module.split(".")[0] == "socketio" and func_name == "AsyncServer":
         return Verdict.SAFE, f"{module}.{func_name} is an async Socket.IO server constructor"
 
@@ -254,6 +286,9 @@ def classify_call(
 
     if module and module.split(".")[0] == "sqlalchemy" and func_name in SAFE_SQLALCHEMY_QUERY_SYMBOLS:
         return Verdict.SAFE, f"{module}.{func_name} only builds a SQL expression"
+
+    if module and (module, func_name) in SAFE_THIRD_PARTY_FUNCTIONS:
+        return Verdict.SAFE, f"{module}.{func_name} is pure in-memory data inspection"
 
     if (
         object_type
@@ -264,6 +299,16 @@ def classify_call(
         return (
             Verdict.BLOCKING,
             f"{object_type}.{func_name} is synchronous database I/O",
+        )
+
+    if (
+        object_type
+        and func_name == "result"
+        and any(hint in object_type for hint in SYNC_FUTURE_OBJECT_HINTS)
+    ):
+        return (
+            Verdict.BLOCKING,
+            f"{object_type}.result waits synchronously for a future",
         )
 
     # asyncio itself is mostly safe, but these APIs try to drive an event loop
@@ -316,9 +361,10 @@ def classify_call(
     #     happens in its methods, which the checker traces via object_type.
     #   - Exception class constructor (any origin): SAFE. `raise HTTPException(...)`
     #     does not block; instantiating an exception is pure object creation.
-    #   - Other third-party class constructor (e.g. requests.Session()): leave
-    #     to the BLOCKING fall-through, since those represent synchronous
-    #     resource acquisition.
+    #   - Third-party class constructor: SAFE by default. Constructors like
+    #     HumanMessage(...), ChatOpenAI(...), Config(...), or
+    #     ConfidentialClientApplication(...) create objects/configuration. The
+    #     blocking work happens on explicit methods such as get/post/invoke/execute.
     if module and not object_type:
         _origin_check = resolve_module_origin(module)
         if _origin_check in (
@@ -346,6 +392,10 @@ def classify_call(
                             Verdict.SAFE,
                             f"{module}.{func_name} is an exception class",
                         )
+                    return (
+                        Verdict.SAFE,
+                        f"{module}.{func_name} is a third-party class constructor",
+                    )
             except BaseException:
                 pass
 
@@ -440,7 +490,7 @@ def classify_call(
             # The static shape is still a direct third-party call.
             if not attr_exists(module, func_name):
                 if origin == ModuleOrigin.THIRD_PARTY:
-                    if func_name and func_name[0].isupper() and any(
+                    if func_name and _looks_like_constructor(func_name) and any(
                         func_name.endswith(suffix)
                         for suffix in ("Error", "Exception", "Warning")
                     ):
@@ -452,6 +502,11 @@ def classify_call(
                         return (
                             Verdict.SAFE,
                             f"{module}.{func_name} is an async client constructor (by name)",
+                        )
+                    if _looks_like_constructor(func_name):
+                        return (
+                            Verdict.SAFE,
+                            f"{module}.{func_name} is a class constructor (by name)",
                         )
                     return (
                         Verdict.BLOCKING,
@@ -502,13 +557,18 @@ def classify_call(
             )
         # Single-segment uninstalled module: still suppress exception-class
         # constructors by name (raising exceptions doesn't block).
-        if func_name and func_name[0].isupper() and any(
+        if func_name and _looks_like_constructor(func_name) and any(
             func_name.endswith(suffix)
             for suffix in ("Error", "Exception", "Warning")
         ):
             return (
                 Verdict.SAFE,
                 f"{module}.{func_name} is an exception class (by name)",
+            )
+        if _looks_like_constructor(func_name):
+            return (
+                Verdict.SAFE,
+                f"{module}.{func_name} is a class constructor (by name)",
             )
         return (
             Verdict.BLOCKING,
