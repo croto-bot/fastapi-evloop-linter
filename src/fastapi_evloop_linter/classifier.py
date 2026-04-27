@@ -98,6 +98,17 @@ def classify_call(
     if not func_name:
         return Verdict.UNKNOWN, "missing function name"
 
+    # 1a. getattr(module, <dynamic>) — unknown function on a known module.
+    # Flag as warning if the module is not safe (potential blocking call).
+    if func_name == "<getattr>" and module:
+        top_module = module.split(".")[0]
+        if top_module in SAFE_MODULES:
+            return Verdict.SAFE, f"{module} is a pure-computation module"
+        return (
+            Verdict.BLOCKING,
+            f"getattr() on {module} — dynamic dispatch may call blocking function",
+        )
+
     # 1. Local function (defined in the analyzed module) — handled by tracer; safe here.
     if module is None and func_name in analysis.functions:
         return Verdict.SAFE, "local function"

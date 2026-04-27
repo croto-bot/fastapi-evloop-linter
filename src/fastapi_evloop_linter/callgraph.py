@@ -305,6 +305,12 @@ class CallGraphBuilder(ast.NodeVisitor):
 
             return None, attr_name, None
 
+        # Handle inline getattr call: getattr(module, 'func')()
+        if isinstance(func, ast.Call):
+            getattr_result = self._resolve_getattr_call(func)
+            if getattr_result:
+                return getattr_result[0], getattr_result[1], None
+
         return None, None, None
 
     def _track_assignment_type(self, target: ast.expr, value: ast.expr) -> None:
@@ -322,6 +328,15 @@ class CallGraphBuilder(ast.NodeVisitor):
                         self._current_func.var_types[target.id] = self.analysis.import_froms[name].name
                     elif name in self.analysis.imports:
                         self._current_func.var_types[target.id] = name
+                    elif name in self._current_func.var_aliases:
+                        # Variable alias from getattr or similar: cls = getattr(smtplib, 'SMTP')
+                        alias_mod, alias_name = self._current_func.var_aliases[name]
+                        if alias_name:
+                            self._current_func.var_types[target.id] = alias_name
+                        else:
+                            self._current_func.var_types[target.id] = name
+                        if alias_mod:
+                            self._current_func.var_module[target.id] = alias_mod
                     else:
                         self._current_func.var_types[target.id] = name
 
@@ -407,10 +422,132 @@ class CallGraphBuilder(ast.NodeVisitor):
                     if func_name:
                         self.analysis.class_attr_types.setdefault(class_name, {})[attr_name] = func_name
 
+    def _resolve_getattr_call(self, node: ast.Call) -> tuple[str | None, str | None] | None:
+        """Resolve getattr(module_or_var, 'name') to (module, func_name).
+
+        Handles both:
+        - getattr(imported_module, 'func_name')  -> (module, func_name)
+        - getattr(local_var, 'func_name')         -> resolves var to module
+        - getattr(module, string_var)              -> (module, None) as conservative
+        Returns None if the pattern doesn't match.
+        """
+        if not isinstance(node.func, ast.Name) or node.func.id != "getattr":
+            return None
+        if len(node.args) < 2:
+            return None
+
+        obj_arg, name_arg = node.args[0], node.args[1]
+
+        # Resolve the module from the first argument
+        module: str | None = None
+        if isinstance(obj_arg, ast.Name):
+            base = obj_arg.id
+            if base in self.analysis.imports:
+                module = self.analysis.imports[base].module
+            elif base in self.analysis.import_froms:
+                module = self.analysis.import_froms[base].module
+            elif self._current_func and base in self._current_func.var_module:
+                module = self._current_func.var_module[base]
+            elif self._current_func and base in self._current_func.var_aliases:
+                # Variable assigned an imported module: mod = time
+                alias_mod, alias_name = self._current_func.var_aliases[base]
+                if alias_mod and alias_name is None:
+                    # mod = time  -> var_aliases["mod"] = ("time", None)
+                    module = alias_mod
+        elif isinstance(obj_arg, ast.Attribute):
+            # getattr(urllib.request, 'urlopen') - dotted module
+            resolved = self._resolve_dotted_module(obj_arg)
+            if resolved:
+                module = resolved
+
+        if module is None:
+            return None
+
+        # Resolve the attribute name from the second argument
+        if isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str):
+            return (module, name_arg.value)
+
+        # Variable name arg (e.g., getattr(time, method_name)) —
+        # try to resolve the variable to a string literal if it was assigned earlier.
+        if isinstance(name_arg, ast.Name) and self._current_func:
+            resolved_name = self._try_resolve_string_var(name_arg.id)
+            if resolved_name:
+                return (module, resolved_name)
+
+        # Dynamic second arg (e.g., method.lower(), computed expr) —
+        # we know the module but not the exact function. Flag with a generic
+        # marker so the classifier can warn about potential blocking getattr.
+        return (module, "<getattr>")
+
+    def _try_resolve_string_var(self, var_name: str) -> str | None:
+        """Try to resolve a variable to a string literal by scanning assignments.
+
+        Looks through the current function's AST body for simple assignments like
+        `method_name = 'sleep'` and returns the string value if found.
+        """
+        if not self._current_func or not self._current_func.node:
+            return None
+        for stmt in ast.walk(self._current_func.node):
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if (
+                        isinstance(target, ast.Name)
+                        and target.id == var_name
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)
+                    ):
+                        return stmt.value.value
+        return None
+
+    def _resolve_dotted_module(self, node: ast.Attribute) -> str | None:
+        """Resolve a dotted attribute chain to a module path.
+
+        E.g., urllib.request -> 'urllib.request' if imported.
+        """
+        parts: list[str] = [node.attr]
+        cur: ast.expr = node.value
+        while isinstance(cur, ast.Attribute):
+            parts.insert(0, cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            base = cur.id
+            # Build candidate keys to match against imports
+            candidate_keys = []
+            if base in self.analysis.imports:
+                candidate_keys.append((base, []))
+            for key in self.analysis.imports:
+                if key.split(".")[0] == base and "." in key:
+                    candidate_keys.append((key, key.split(".")[1:]))
+            best: tuple[str, list[str]] | None = None
+            for key, key_tail in candidate_keys:
+                if key_tail == parts[: len(key_tail)]:
+                    if best is None or len(key_tail) > len(best[1]):
+                        best = (key, key_tail)
+            if best is not None:
+                key, key_tail = best
+                imp = self.analysis.imports[key]
+                remaining = parts[len(key_tail) :]
+                if remaining:
+                    return imp.module + "." + ".".join(remaining)
+                return imp.module
+        return None
+
     def _track_var_alias(self, var_name: str, value: ast.expr) -> None:
         """Track when a variable is assigned a reference to a blocking function."""
         if not self._current_func:
             return
+
+        # getattr(module, 'func_name') -> alias to (module, func_name)
+        if isinstance(value, ast.Call):
+            getattr_result = self._resolve_getattr_call(value)
+            if getattr_result:
+                self._current_func.var_aliases[var_name] = getattr_result
+                # Also track var_module for constructor patterns:
+                # cls = getattr(smtplib, 'SMTP'); server = cls(...)
+                mod, name = getattr_result
+                if name:
+                    self._current_func.var_module[var_name] = mod
+                return
 
         # Direct module.attr reference: f = time.sleep
         if isinstance(value, ast.Attribute):
