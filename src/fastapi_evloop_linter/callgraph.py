@@ -792,27 +792,71 @@ class CallGraphBuilder(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _handle_context_manager(self, node: ast.With | ast.AsyncWith) -> None:
-        """Track __enter__ and __aenter__ calls in with statements."""
+        """Track __enter__/__aenter__ calls and as-variable type in with statements."""
         if not self._current_func:
             return
 
         for item in node.items:
-            if not item.context_expr or not isinstance(item.context_expr, ast.Call):
-                continue
+            ctx_expr = item.context_expr
 
-            ctx_call = item.context_expr
-            if not isinstance(ctx_call.func, ast.Name):
-                continue
+            # --- Case A: context expression is a Call (most common) ---
+            if isinstance(ctx_expr, ast.Call):
+                class_name: str | None = None
+                source_module: str | None = None
 
-            class_name = ctx_call.func.id
-            # Check for __enter__ (sync context manager)
-            enter_key = f"{class_name}.__enter__"
-            if enter_key in self.analysis.functions:
-                self._add_context_manager_call(ctx_call, enter_key, class_name)
-            # Check for __aenter__ (async context manager)
-            aenter_key = f"{class_name}.__aenter__"
-            if aenter_key in self.analysis.functions:
-                self._add_context_manager_call(ctx_call, aenter_key, class_name)
+                if isinstance(ctx_expr.func, ast.Name):
+                    class_name = ctx_expr.func.id
+                elif isinstance(ctx_expr.func, ast.Attribute):
+                    class_name = ctx_expr.func.attr
+                    # Resolve source module from module.Class pattern
+                    if isinstance(ctx_expr.func.value, ast.Name):
+                        base = ctx_expr.func.value.id
+                        if base in self.analysis.imports:
+                            source_module = self.analysis.imports[base].module
+                        elif base in self.analysis.import_froms:
+                            source_module = self.analysis.import_froms[base].module
+
+                if class_name:
+                    # Track the as-variable type and source module
+                    self._track_with_var(item, class_name, source_module)
+
+                    # Check for __enter__ / __aenter__ in locally-defined classes
+                    enter_key = f"{class_name}.__enter__"
+                    if enter_key in self.analysis.functions:
+                        self._add_context_manager_call(ctx_expr, enter_key, class_name)
+                    aenter_key = f"{class_name}.__aenter__"
+                    if aenter_key in self.analysis.functions:
+                        self._add_context_manager_call(ctx_expr, aenter_key, class_name)
+
+            # --- Case B: context expression is a plain variable (with zf as archive:) ---
+            elif isinstance(ctx_expr, ast.Name):
+                var_name = ctx_expr.id
+                # Look up the variable's type from var_types or module_var_types
+                class_name = None
+                source_module = None
+                if var_name in self._current_func.var_types:
+                    class_name = self._current_func.var_types[var_name]
+                    source_module = self._current_func.var_module.get(var_name)
+                elif var_name in self.analysis.module_var_types:
+                    class_name = self.analysis.module_var_types[var_name]
+                    source_module = self.analysis.module_var_module.get(var_name)
+                if class_name:
+                    self._track_with_var(item, class_name, source_module)
+
+    def _track_with_var(
+        self,
+        item: ast.withitem,
+        class_name: str,
+        source_module: str | None,
+    ) -> None:
+        """Store the type (and optionally module) of the `as` variable in a with statement."""
+        if not self._current_func:
+            return
+        if item.optional_vars and isinstance(item.optional_vars, ast.Name):
+            var_name = item.optional_vars.id
+            self._current_func.var_types[var_name] = class_name
+            if source_module:
+                self._current_func.var_module[var_name] = source_module
 
     def _add_context_manager_call(self, ctx_call: ast.Call, key: str, class_name: str) -> None:
         arg_names: list[str | None] = []
