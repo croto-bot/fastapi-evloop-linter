@@ -8,6 +8,7 @@ the call tree.
 from __future__ import annotations
 
 import ast
+import builtins
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -328,7 +329,7 @@ class CallGraphBuilder(ast.NodeVisitor):
             # for an exported callable matching this name. e.g. `import time` then
             # bare `sleep(5)` (semantically wrong but legal-looking) — we infer
             # `time.sleep` if exactly one imported module exposes a `sleep` attr.
-            if name not in self.analysis.functions:
+            if name not in self.analysis.functions and not hasattr(builtins, name):
                 inferred = self._infer_bare_name_module(name)
                 if inferred is not None:
                     return inferred, name, None
@@ -916,18 +917,29 @@ class CallGraphBuilder(ast.NodeVisitor):
             params.append(args.kwarg.arg)
         return params
 
-    def _visit_function_body(self, node: ast.AsyncFunctionDef | ast.FunctionDef) -> None:
-        """Visit function args + body but NOT decorator_list.
+    def _visit_definition_defaults(self, node: ast.AsyncFunctionDef | ast.FunctionDef) -> None:
+        """Visit default values evaluated by a nested function definition.
 
-        Decorators are part of the surrounding scope, not the function body —
-        recording them as calls inside the function would attribute decorator
-        side effects (e.g. `@app.get("/x")`) to the function being decorated.
+        Top-level function defaults run at import time, outside the request event
+        loop. Nested function defaults run when the enclosing function executes,
+        so keep those calls attributed to the enclosing scope.
         """
         for arg_default in node.args.defaults:
             self.visit(arg_default)
         for arg_default in node.args.kw_defaults:
             if arg_default is not None:
                 self.visit(arg_default)
+
+    def _visit_function_body(self, node: ast.AsyncFunctionDef | ast.FunctionDef) -> None:
+        """Visit function body but NOT decorator_list or top-level parameter defaults.
+
+        Decorators are part of the surrounding scope, not the function body —
+        recording them as calls inside the function would attribute decorator
+        side effects (e.g. `@app.get("/x")`) to the function being decorated.
+
+        Parameter defaults are also definition-time work. FastAPI uses this for
+        request metadata such as `Depends(...)`, `Query(...)`, and `Form(...)`.
+        """
         for stmt in node.body:
             self.visit(stmt)
 
@@ -935,6 +947,8 @@ class CallGraphBuilder(ast.NodeVisitor):
         parent = self._current_func
         class_name = self._current_class
         symbol = self._symbol_for(node.name, class_name=class_name, parent=parent if not class_name else None)
+        if parent is not None:
+            self._visit_definition_defaults(node)
         func = FuncDef(
             name=node.name,
             is_async=True,
@@ -968,6 +982,8 @@ class CallGraphBuilder(ast.NodeVisitor):
         parent = self._current_func
         class_name = self._current_class
         symbol = self._symbol_for(node.name, class_name=class_name, parent=parent if not class_name else None)
+        if parent is not None:
+            self._visit_definition_defaults(node)
         func = FuncDef(
             name=node.name,
             is_async=False,

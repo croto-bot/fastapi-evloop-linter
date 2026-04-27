@@ -45,7 +45,7 @@ SAFE_MODULES: frozenset[str] = frozenset({
     "math", "operator", "itertools", "functools", "collections",
     "dataclasses", "typing", "abc", "enum", "decimal", "fractions",
     "statistics", "base64", "secrets", "uuid", "copy", "string",
-    "re", "types", "contextlib",
+    "re", "types", "contextlib", "random",
     "asyncio", "datetime", "logging", "traceback", "warnings",
 })
 
@@ -55,6 +55,22 @@ SAFE_STDLIB_FUNCTIONS: frozenset[tuple[str, str]] = frozenset({
     ("hashlib", "md5"), ("hashlib", "sha1"), ("hashlib", "sha256"),
     ("hashlib", "sha512"), ("hashlib", "sha384"), ("hashlib", "sha224"),
     ("hashlib", "blake2b"), ("hashlib", "blake2s"), ("hashlib", "new"),
+    ("os.path", "abspath"), ("os.path", "basename"), ("os.path", "dirname"),
+    ("os.path", "join"), ("os.path", "normpath"), ("os.path", "realpath"),
+    ("os.path", "relpath"), ("os.path", "split"), ("os.path", "splitext"),
+    ("posixpath", "abspath"), ("posixpath", "basename"), ("posixpath", "dirname"),
+    ("posixpath", "join"), ("posixpath", "normpath"), ("posixpath", "realpath"),
+    ("posixpath", "relpath"), ("posixpath", "split"), ("posixpath", "splitext"),
+    ("time", "monotonic"), ("time", "perf_counter"), ("time", "process_time"),
+    ("time", "localtime"), ("time", "strftime"), ("time", "time"), ("time", "time_ns"),
+    ("html", "escape"), ("html", "unescape"),
+    ("inspect", "iscoroutine"), ("inspect", "iscoroutinefunction"),
+    ("inspect", "signature"),
+    ("mimetypes", "guess_extension"), ("mimetypes", "guess_type"),
+    ("urllib.parse", "quote"), ("urllib.parse", "unquote"),
+    ("urllib.parse", "urlencode"), ("urllib.parse", "urljoin"),
+    ("urllib.parse", "urlparse"), ("urllib.parse", "urlsplit"),
+    ("jwt", "decode"),
 })
 
 # Method/property accesses on stdlib classes that are pure (no I/O).
@@ -62,6 +78,19 @@ SAFE_STDLIB_FUNCTIONS: frozenset[tuple[str, str]] = frozenset({
 SAFE_STDLIB_METHODS: frozenset[tuple[str, str, str]] = frozenset({
     # str methods on values returned by known-safe serializers.
     ("json", "dumps", "encode"),
+    ("json", "loads", "get"),
+    ("json", "get", "get"),
+    ("jwt", "decode", "get"),
+    ("hashlib", "md5", "hexdigest"),
+    ("hashlib", "sha1", "hexdigest"),
+    ("hashlib", "sha224", "hexdigest"),
+    ("hashlib", "sha256", "hexdigest"),
+    ("hashlib", "sha384", "hexdigest"),
+    ("hashlib", "sha512", "hexdigest"),
+
+    # str/path methods on pure os.path results.
+    ("os.path", "abspath", "startswith"),
+    ("posixpath", "abspath", "startswith"),
 
     # pathlib.Path: pure path-string manipulation, no syscalls.
     ("pathlib", "Path", "is_absolute"),
@@ -87,6 +116,98 @@ SAFE_STDLIB_METHODS: frozenset[tuple[str, str, str]] = frozenset({
     ("pathlib", "Path", "root"),
 })
 
+# FastAPI framework helpers are declaration metadata or lightweight framework
+# objects. They do not represent blocking application I/O on the event loop.
+SAFE_FASTAPI_SYMBOLS: frozenset[str] = frozenset({
+    "APIRouter",
+    "BackgroundTasks",
+    "Body",
+    "Cookie",
+    "Depends",
+    "FastAPI",
+    "File",
+    "Form",
+    "Header",
+    "Path",
+    "Query",
+    "Request",
+    "Response",
+    "Security",
+    "UploadFile",
+    "status",
+    "FileResponse",
+    "HTMLResponse",
+    "JSONResponse",
+    "PlainTextResponse",
+    "RedirectResponse",
+    "StreamingResponse",
+})
+
+SAFE_SQLALCHEMY_QUERY_SYMBOLS: frozenset[str] = frozenset({
+    "and_",
+    "cast",
+    "count",
+    "delete",
+    "distinct",
+    "filter",
+    "filter_by",
+    "func",
+    "get",
+    "group_by",
+    "join",
+    "json_extract",
+    "json_extract_path_text",
+    "label",
+    "limit",
+    "lower",
+    "max",
+    "offset",
+    "or_",
+    "order_by",
+    "outerjoin",
+    "params",
+    "scalar_subquery",
+    "select",
+    "select_from",
+    "subquery",
+    "sum",
+    "text",
+    "update",
+    "values",
+    "where",
+    "coalesce",
+    "exists",
+    "replace",
+    "Boolean",
+    "case",
+    "Column",
+    "correlate",
+    "DateTime",
+    "Float",
+    "ForeignKey",
+    "Integer",
+    "JSON",
+    "String",
+})
+
+SYNC_DB_METHODS: frozenset[str] = frozenset({
+    "commit",
+    "execute",
+    "executemany",
+    "flush",
+    "rollback",
+    "scalar",
+    "scalars",
+})
+
+SYNC_DB_OBJECT_HINTS: frozenset[str] = frozenset({
+    "Connection",
+    "Cursor",
+    "Engine",
+    "ScopedSession",
+    "Session",
+})
+
 
 def classify_call(
     module: str | None,
@@ -100,6 +221,50 @@ def classify_call(
     """
     if not func_name:
         return Verdict.UNKNOWN, "missing function name"
+
+    if module and module.split(".")[0] == "fastapi" and func_name in SAFE_FASTAPI_SYMBOLS:
+        return Verdict.SAFE, f"{module}.{func_name} is FastAPI framework metadata"
+
+    if module and module.split(".")[0] == "aiofiles":
+        return Verdict.SAFE, f"{module}.{func_name} is aiofiles async file I/O"
+
+    if module and module.split(".")[0] == "aiohttp":
+        return Verdict.SAFE, f"{module}.{func_name} is aiohttp async client support"
+
+    if module and module.split(".")[0] == "opentelemetry" and func_name in {
+        "get_current_span",
+        "set_attribute",
+    }:
+        return Verdict.SAFE, f"{module}.{func_name} records telemetry metadata"
+
+    if module and module.startswith("unittest.mock"):
+        return Verdict.SAFE, f"{module}.{func_name} is test assertion metadata"
+
+    if module and module.split(".")[0] == "pydantic" and func_name in {
+        "BaseModel",
+        "Field",
+    }:
+        return Verdict.SAFE, f"{module}.{func_name} is pydantic validation metadata"
+
+    if module and module.split(".")[0] == "socketio" and func_name == "AsyncServer":
+        return Verdict.SAFE, f"{module}.{func_name} is an async Socket.IO server constructor"
+
+    if module and module.split(".")[0] == "socketio" and object_type == "AsyncServer":
+        return Verdict.ASYNC, f"{module}.{func_name} is an async Socket.IO server method"
+
+    if module and module.split(".")[0] == "sqlalchemy" and func_name in SAFE_SQLALCHEMY_QUERY_SYMBOLS:
+        return Verdict.SAFE, f"{module}.{func_name} only builds a SQL expression"
+
+    if (
+        object_type
+        and func_name in SYNC_DB_METHODS
+        and not object_type.startswith("Async")
+        and any(hint in object_type for hint in SYNC_DB_OBJECT_HINTS)
+    ):
+        return (
+            Verdict.BLOCKING,
+            f"{object_type}.{func_name} is synchronous database I/O",
+        )
 
     # asyncio itself is mostly safe, but these APIs try to drive an event loop
     # from inside code that may already be running on one.

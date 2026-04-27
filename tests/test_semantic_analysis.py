@@ -513,3 +513,184 @@ async def ep(s: str):
     return {"now": datetime.now(UTC), "name": p.name}
 """
     assert_clean(source)
+
+
+def test_fastapi_parameter_defaults_are_not_event_loop_calls() -> None:
+    source = """\
+from typing import Optional
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
+router = APIRouter()
+
+def get_admin_user():
+    return object()
+
+def get_async_session():
+    return object()
+
+@router.get("/models")
+async def get_model_analytics(
+    start_date: Optional[int] = Query(None, description="Start timestamp"),
+    end_date: Optional[int] = Query(None, description="End timestamp"),
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    return {"ok": True}
+"""
+    assert_clean(source)
+
+
+def test_fastapi_annotated_dependency_metadata_is_not_event_loop_call() -> None:
+    source = """\
+from typing import Annotated
+from fastapi import Depends, FastAPI
+
+app = FastAPI()
+
+def get_current_user():
+    return object()
+
+@app.get("/me")
+async def me(user: Annotated[object, Depends(get_current_user)]):
+    return {"ok": True}
+"""
+    assert_clean(source)
+
+
+def test_fastapi_framework_objects_are_not_event_loop_blocking_calls() -> None:
+    source = """\
+from fastapi import Request, Response, UploadFile, status
+import io
+
+async def build_framework_objects(app):
+    request = Request({
+        "type": "http",
+        "method": "GET",
+        "path": "/internal",
+        "headers": [],
+        "query_string": b"",
+        "app": app,
+    })
+    file = UploadFile(file=io.BytesIO(b"ok"), filename="x.txt")
+    return Response(status_code=status.HTTP_302_FOUND, headers={"X-File": file.filename})
+"""
+    assert_clean(source)
+
+
+def test_nested_function_defaults_still_report_when_evaluated_in_async_body() -> None:
+    source = """\
+import time
+
+def slow_default():
+    time.sleep(1)
+    return "default"
+
+async def outer():
+    def inner(value=slow_default()):
+        return value
+    return inner()
+"""
+    assert_reports(source, "time.sleep")
+
+
+def test_open_webui_true_positive_patterns_still_report() -> None:
+    source = """\
+import os
+import subprocess
+import time
+import requests
+import black
+import markdown
+
+async def transcribe_upload(file):
+    contents = file.file.read()
+    file_path = os.path.join("/tmp", "audio.wav")
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    return requests.post("https://example.test/stt", files={"file": contents})
+
+async def format_code(source: str):
+    return black.format_str(source, mode=black.Mode())
+
+async def get_html_from_markdown(md: str):
+    return markdown.markdown(md)
+
+async def install_frontmatter_requirements():
+    subprocess.check_call(["python", "-m", "pip", "install", "x"])
+
+async def redis_retry():
+    time.sleep(1)
+"""
+    found = messages(source)
+    assert any("open" in message for message in found), found
+    assert any("requests.post" in message for message in found), found
+    assert any("black.format_str" in message for message in found), found
+    assert any("markdown.markdown" in message for message in found), found
+    assert any("subprocess.check_call" in message for message in found), found
+    assert any("time.sleep" in message for message in found), found
+
+
+def test_open_webui_noise_buckets_are_clean() -> None:
+    source = """\
+import time
+import json
+import os
+import html
+import inspect
+import random
+import urllib.parse
+import aiofiles
+import aiohttp
+import socketio
+from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import Boolean, Column, Integer, String
+
+async def query_builder_only(model, data):
+    now = time.time()
+    now_ns = time.time_ns()
+    payload = json.loads(data).get("payload", {})
+    path = os.path.abspath(os.path.join("/tmp", "x"))
+    url = urllib.parse.urljoin("https://example.test", "/x")
+    escaped = html.escape("<x>")
+    choice = random.choice(["a", "b"])
+    is_coro = inspect.iscoroutine(query_builder_only(model, data))
+    sig = inspect.signature(query_builder_only)
+    timeout = aiohttp.ClientTimeout(total=60)
+    form = aiohttp.FormData()
+    form.add_field("file", b"ok")
+    sio = socketio.AsyncServer()
+    await sio.emit("event", {"ok": True})
+    async with aiofiles.open(path, "wb") as f:
+        await f.write(b"ok")
+    stmt = (
+        select(model)
+        .filter_by(id=payload.get("id"))
+        .filter(model.name != None)
+        .where(and_(model.created_at <= now, or_(model.updated_at <= now_ns)))
+        .outerjoin(model.owner)
+        .order_by(model.created_at.desc())
+        .limit(10)
+        .offset(0)
+    )
+    count_stmt = select(func.count()).select_from(model).scalar_subquery()
+    update_stmt = update(model).filter_by(id=payload.get("id")).values(name="x")
+    delete_stmt = delete(model).filter_by(id=payload.get("id"))
+    raw = text("SELECT 1")
+    columns = [Column("id", Integer), Column("name", String), Column("active", Boolean)]
+    return stmt, count_stmt, update_stmt, delete_stmt, raw, timeout, url, escaped, choice, is_coro, sig, columns
+"""
+    assert_clean(source)
+
+
+def test_sync_session_execute_reports_even_when_session_is_project_local() -> None:
+    source = """\
+from open_webui.internal.db import ScopedSession
+from sqlalchemy import text
+
+async def healthcheck_with_db():
+    ScopedSession.execute(text("SELECT 1")).all()
+"""
+    found = messages(source)
+    assert any("ScopedSession.execute" in message for message in found), found
+    assert not any("sqlalchemy.text" in message for message in found), found
