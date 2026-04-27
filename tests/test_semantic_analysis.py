@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import fastapi_evloop_linter.classifier as classifier
 from fastapi_evloop_linter.checker import EventLoopChecker
+from fastapi_evloop_linter.classifier import ModuleOrigin, Verdict, classify_call
 
 
 def messages(source: str) -> list[str]:
@@ -62,6 +64,85 @@ async def db_ep():
     return conn.execute("SELECT 1").fetchall()
 """
     assert_reports(source, "sqlite3.connect.execute")
+
+
+def test_plain_async_function_is_checked_without_fastapi_route() -> None:
+    source = """\
+import time
+
+async def process_job():
+    time.sleep(1)
+"""
+    assert_reports(source, "time.sleep")
+
+
+def test_plain_async_function_traces_sync_local_helpers() -> None:
+    source = """\
+import time
+
+def parse_file():
+    time.sleep(1)
+
+async def process_job():
+    parse_file()
+"""
+    assert_reports(source, "time.sleep")
+
+
+def test_direct_third_party_call_reports_when_attribute_probe_fails(monkeypatch) -> None:
+    monkeypatch.setattr(
+        classifier,
+        "resolve_module_origin",
+        lambda module: ModuleOrigin.THIRD_PARTY,
+    )
+    monkeypatch.setattr(classifier, "attr_exists", lambda module, name: False)
+    monkeypatch.setattr(
+        classifier,
+        "is_async_callable",
+        lambda module, name, object_type: False,
+    )
+
+    verdict, reason = classify_call("pandas", "read_csv", None, analysis=object())
+
+    assert verdict == Verdict.BLOCKING
+    assert "could not verify async" in reason
+
+
+def test_project_local_direct_call_is_not_treated_as_third_party(monkeypatch) -> None:
+    monkeypatch.setattr(
+        classifier,
+        "resolve_module_origin",
+        lambda module: ModuleOrigin.PROJECT_LOCAL,
+    )
+    monkeypatch.setattr(
+        classifier,
+        "is_async_callable",
+        lambda module, name, object_type: False,
+    )
+
+    verdict, reason = classify_call("src.models", "Schema", None, analysis=object())
+
+    assert verdict == Verdict.UNKNOWN
+    assert "could not classify" in reason
+
+
+def test_third_party_exception_constructor_is_safe_when_attribute_probe_fails(monkeypatch) -> None:
+    monkeypatch.setattr(
+        classifier,
+        "resolve_module_origin",
+        lambda module: ModuleOrigin.THIRD_PARTY,
+    )
+    monkeypatch.setattr(classifier, "attr_exists", lambda module, name: False)
+    monkeypatch.setattr(
+        classifier,
+        "is_async_callable",
+        lambda module, name, object_type: False,
+    )
+
+    verdict, reason = classify_call("fastapi", "HTTPException", None, analysis=object())
+
+    assert verdict == Verdict.SAFE
+    assert "exception class" in reason
 
 
 def test_bound_method_variable_reports_blocking_body() -> None:

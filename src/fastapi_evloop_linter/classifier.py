@@ -60,6 +60,9 @@ SAFE_STDLIB_FUNCTIONS: frozenset[tuple[str, str]] = frozenset({
 # Method/property accesses on stdlib classes that are pure (no I/O).
 # Format: (module, class, attr).
 SAFE_STDLIB_METHODS: frozenset[tuple[str, str, str]] = frozenset({
+    # str methods on values returned by known-safe serializers.
+    ("json", "dumps", "encode"),
+
     # pathlib.Path: pure path-string manipulation, no syscalls.
     ("pathlib", "Path", "is_absolute"),
     ("pathlib", "Path", "is_reserved"),
@@ -168,6 +171,11 @@ def classify_call(
                             Verdict.SAFE,
                             f"{module}.{func_name} is a stdlib class constructor",
                         )
+                    if func_name.startswith("Async"):
+                        return (
+                            Verdict.SAFE,
+                            f"{module}.{func_name} is an async client constructor",
+                        )
                     if issubclass(_attr, BaseException):
                         return (
                             Verdict.SAFE,
@@ -260,8 +268,30 @@ def classify_call(
                 return Verdict.UNKNOWN, f"could not import {module}"
         else:
             # Direct call form: module.func_name. Require the attribute to
-            # exist on the module before classifying as blocking.
+            # exist on stdlib modules before classifying as blocking. For
+            # third-party modules, a failed import/attribute probe commonly
+            # means the target project's venv is not importable by the linter
+            # interpreter (for example Python 3.11 wheels under Python 3.12).
+            # The static shape is still a direct third-party call.
             if not attr_exists(module, func_name):
+                if origin == ModuleOrigin.THIRD_PARTY:
+                    if func_name and func_name[0].isupper() and any(
+                        func_name.endswith(suffix)
+                        for suffix in ("Error", "Exception", "Warning")
+                    ):
+                        return (
+                            Verdict.SAFE,
+                            f"{module}.{func_name} is an exception class (by name)",
+                        )
+                    if func_name.startswith("Async"):
+                        return (
+                            Verdict.SAFE,
+                            f"{module}.{func_name} is an async client constructor (by name)",
+                        )
+                    return (
+                        Verdict.BLOCKING,
+                        f"{module}.{func_name} is synchronous (third-party); could not verify async",
+                    )
                 return (
                     Verdict.UNKNOWN,
                     f"{module}.{func_name} not exported by module",

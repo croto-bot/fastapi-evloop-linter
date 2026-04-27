@@ -22,6 +22,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from .introspect import register_project_roots
+
 # Files/directories whose presence marks the root of a Python project.
 PROJECT_MARKERS: tuple[str, ...] = (
     "pyproject.toml",
@@ -93,11 +95,14 @@ def setup_sys_path(targets: list[Path]) -> dict:
     seen: set[str] = set(sys.path)
     project_roots: list[str] = []
     site_packages: list[str] = []
+    source_roots: list[str] = []
 
     for target in targets:
         _root, additions = discover_paths_for_target(target)
         for path in additions:
             sp = str(path)
+            if "site-packages" not in path.parts:
+                source_roots.append(sp)
             if sp in seen:
                 continue
             seen.add(sp)
@@ -107,4 +112,5 @@ def setup_sys_path(targets: list[Path]) -> dict:
             else:
                 project_roots.append(sp)
 
+    register_project_roots(source_roots)
     return {"project_roots": project_roots, "site_packages": site_packages}

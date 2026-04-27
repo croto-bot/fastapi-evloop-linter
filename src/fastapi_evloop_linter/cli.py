@@ -14,7 +14,7 @@ from .env import setup_sys_path
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="fastapi-evloop-linter",
-        description="Detect event loop blocking calls in FastAPI async endpoints",
+        description="Detect event loop blocking calls in async Python entrypoints",
     )
     parser.add_argument(
         "paths",
@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         output = {
             "files_checked": result.files_checked,
+            "entrypoints_found": result.endpoints_found,
             "endpoints_found": result.endpoints_found,
             "violations": [
                 {
@@ -113,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if violations:
             print(f"\nFound {len(violations)} violation(s) in {result.files_checked} file(s) "
-                  f"({result.endpoints_found} endpoint(s) checked)", file=sys.stderr)
+                  f"({result.endpoints_found} entrypoint(s) checked)", file=sys.stderr)
 
     return 1 if any(v.severity == "error" for v in violations) else 0
 

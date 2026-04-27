@@ -1,8 +1,8 @@
-"""Main checker: detects event loop blocking calls in FastAPI async code.
+"""Main checker: detects event loop blocking calls in async Python code.
 
 This is the core of the linter. It:
 1. Parses Python files and builds a call graph
-2. Identifies async FastAPI endpoints
+2. Identifies async event-loop entrypoints
 3. Traces the call tree to find blocking calls at any depth
 4. Reports violations with precise locations
 """
@@ -61,7 +61,7 @@ class LintResult:
 
 
 class EventLoopChecker:
-    """Detects event loop blocking calls in FastAPI async endpoints."""
+    """Detects event loop blocking calls in async entrypoints."""
 
     def __init__(self, max_depth: int = 20):
         self.max_depth = max_depth
@@ -90,10 +90,14 @@ class EventLoopChecker:
         """Run violation detection on a module analysis."""
         result = LintResult(files_checked=1)
 
-        # Find all FastAPI endpoints
+        # Find async event-loop entrypoints.
+        #
+        # FastAPI routes are the common case, but background jobs and processors
+        # also run on the same event loop. A direct blocking call inside any
+        # async function has the same runtime effect as one inside a route.
         endpoints: list[FuncDef] = []
         for func in analysis.functions.values():
-            if self._is_endpoint(func):
+            if self._is_entrypoint(func):
                 endpoints.append(func)
                 result.endpoints_found += 1
 
@@ -109,11 +113,31 @@ class EventLoopChecker:
                 visited=visited,
             )
 
+        result.violations = self._dedupe_violations(result.violations)
         return result
+
+    def _dedupe_violations(self, violations: list[Violation]) -> list[Violation]:
+        """Collapse repeated reports for the same blocking operation."""
+        by_location: dict[tuple[str, int, int, str], Violation] = {}
+        for violation in violations:
+            key = (
+                violation.filepath,
+                violation.line,
+                violation.col,
+                violation.message,
+            )
+            existing = by_location.get(key)
+            if existing is None or violation.depth > existing.depth:
+                by_location[key] = violation
+        return list(by_location.values())
 
     def _is_endpoint(self, func: FuncDef) -> bool:
         """Check if a function is a FastAPI endpoint."""
         return "__fastapi_endpoint__" in func.decorators and func.is_async
+
+    def _is_entrypoint(self, func: FuncDef) -> bool:
+        """Check if a function can run directly on the event loop."""
+        return func.is_async
 
     def _get_function(self, analysis: ModuleAnalysis, name: str | None) -> FuncDef | None:
         """Resolve local functions through compatibility aliases and qualified symbols."""

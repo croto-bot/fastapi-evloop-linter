@@ -1,8 +1,8 @@
 # fastapi-evloop-linter
 
-Detect event loop blocking calls in FastAPI async endpoints.
+Detect event loop blocking calls in async Python entrypoints.
 
-A static analysis tool that traces call graphs from async FastAPI endpoints to find blocking synchronous calls (like `time.sleep()`, `requests.get()`, `subprocess.run()`, etc.) at any depth in the execution tree.
+A static analysis tool that traces call graphs from async functions, including FastAPI endpoints and background jobs, to find blocking synchronous calls (like `time.sleep()`, `requests.get()`, `subprocess.run()`, etc.) at any depth in the execution tree.
 
 ## Installation
 
@@ -70,7 +70,7 @@ uv run fastapi-evloop-linter src/
 - **Sync database drivers**: `psycopg2.connect()`, `pymysql.connect()`
 - **Sync Redis**: `redis.Redis()`
 
-All detected through deep call chain analysis:
+All detected through deep call chain analysis from async entrypoints:
 - Traces through helper functions
 - Resolves aliased imports
 - Handles callback patterns
